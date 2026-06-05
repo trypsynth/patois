@@ -110,6 +110,24 @@ pub fn get_locale() -> String {
 	registry::global().lock().unwrap().locale().to_string()
 }
 
+/// Set the default domain without registering a locale directory.
+///
+/// Use this when the domain's catalogs are embedded via [`embed_domain!`] rather than loaded from disk.
+pub fn set_default_domain(domain: &str) {
+	registry::global().lock().unwrap().set_default_domain(domain);
+}
+
+/// Returns all locale codes embedded for the given domain.
+///
+/// The returned codes are the directory names from the `locale/` tree baked in at compile time (e.g. `"de"`, `"fr"`).
+pub fn available_locales(domain: &str) -> Vec<&'static str> {
+	inventory::iter::<EmbeddedDomain>
+		.into_iter()
+		.filter(|ed| ed.name == domain)
+		.flat_map(|ed| ed.files.iter().map(|(locale, _)| *locale))
+		.collect()
+}
+
 #[doc(hidden)]
 pub fn __translate(domain: &str, msgid: &str) -> String {
 	registry::global().lock().unwrap().translate(domain, msgid)

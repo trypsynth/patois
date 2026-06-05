@@ -25,7 +25,7 @@ pub fn embed_domain(_input: TokenStream) -> TokenStream {
 				if mo_path.exists() {
 					let mo_path_str = mo_path.to_string_lossy().to_string();
 					file_entries.push(quote! {
-						(#locale_name, &include_bytes!(#mo_path_str)[..])
+						(#locale_name, { const B: &[u8] = include_bytes!(#mo_path_str); B })
 					});
 				}
 			}
@@ -34,7 +34,7 @@ pub fn embed_domain(_input: TokenStream) -> TokenStream {
 	quote! {
 		::patois::inventory::submit! {
 			::patois::EmbeddedDomain {
-				name: ::env!("CARGO_PKG_NAME"),
+				name: std::env!("CARGO_PKG_NAME"),
 				files: &[ #(#file_entries),* ],
 			}
 		}
