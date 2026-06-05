@@ -1,7 +1,7 @@
 [package]
 name = "patois"
 version = "0.1.0"
-description = "A lightweight, domain-aware i18n library for Rust desktop applications and utility crates."
+description = "A lightweight, domain-aware i18n library for Rust desktop applications."
 edition = "2024"
 license = "MIT"
 keywords = ["i18n", "l10n", "internationalization", "localization", "gettext"]
