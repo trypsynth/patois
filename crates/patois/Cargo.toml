@@ -9,4 +9,4 @@ categories = ["localization", "internationalization"]
 
 [dependencies]
 inventory = "0.3.24"
-patois-macros = { path = "../patois-macros" }
+patois-macros = { version = "0.1.0", path = "../patois-macros" }
