@@ -1,6 +1,6 @@
 [package]
 name = "patois"
-version = "0.1.1"
+version = "0.1.2"
 description = "A lightweight, domain-aware i18n library for Rust desktop applications."
 edition = "2024"
 license = "MIT"
@@ -9,5 +9,5 @@ categories = ["localization", "internationalization"]
 
 [dependencies]
 inventory = "0.3.24"
-patois-macros = { version = "0.1.0", path = "../patois-macros" }
+patois-macros = { version = "0.1.2", path = "../patois-macros" }
 sys-locale = "0.3.2"
