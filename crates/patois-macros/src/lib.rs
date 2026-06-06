@@ -34,7 +34,7 @@ pub fn embed_domain(_input: TokenStream) -> TokenStream {
 	quote! {
 		::patois::inventory::submit! {
 			::patois::EmbeddedDomain {
-				name: std::env!("CARGO_PKG_NAME"),
+				name: env!("CARGO_PKG_NAME"),
 				files: &[ #(#file_entries),* ],
 			}
 		}

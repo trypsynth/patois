@@ -126,8 +126,8 @@ impl Registry {
 	}
 }
 
-/// Normalise locale strings: "en-US" and "en_us" both become "en_US".
-fn normalize_locale(locale: &str) -> String {
+/// Normalize locale strings: "en-US" and "en_us" both become "en_US".
+pub(crate) fn normalize_locale(locale: &str) -> String {
 	let s = locale.replace('-', "_");
 	match s.split_once('_') {
 		Some((lang, region)) => format!("{}_{}", lang.to_lowercase(), region.to_uppercase()),

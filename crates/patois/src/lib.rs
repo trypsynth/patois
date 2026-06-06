@@ -20,12 +20,14 @@
 //! `t!` and `nt!` expand `env!("CARGO_PKG_NAME")` at compile time, falling back to the default domain when no crate-specific catalog is registered.
 
 mod catalog;
+mod lang;
 mod registry;
 
-pub use inventory;
-pub use patois_macros::embed_domain;
-
 use std::path::Path;
+
+pub use inventory;
+pub use lang::{LanguageInfo, LanguageManager, language_name};
+pub use patois_macros::embed_domain;
 
 /// Registered by [`embed_domain!`] for each library crate that embeds its locale files.
 ///
@@ -126,6 +128,30 @@ pub fn available_locales(domain: &str) -> Vec<&'static str> {
 		.filter(|ed| ed.name == domain)
 		.flat_map(|ed| ed.files.iter().map(|(locale, _)| *locale))
 		.collect()
+}
+
+/// Returns the operating system's preferred locale, normalised to patois format (e.g. `"en_US"`).
+///
+/// Falls back to `"en"` if the system locale cannot be determined.
+pub fn system_locale() -> String {
+	sys_locale::get_locale().map(|l| registry::normalize_locale(&l)).unwrap_or_else(|| "en".to_string())
+}
+
+/// Initialise patois for an app that embeds its translations via [`embed_domain!`].
+///
+/// Sets `domain` as the default domain and activates the system locale automatically.
+/// This is the minimal startup call for most desktop apps:
+/// ```rust,no_run
+/// patois::embed_domain!();
+/// fn main() {
+///     patois::init_auto(env!("CARGO_PKG_NAME"));
+/// }
+/// ```
+pub fn init_auto(domain: &str) {
+	let locale = system_locale();
+	let mut reg = registry::global().lock().unwrap();
+	reg.set_default_domain(domain);
+	reg.set_locale(&locale);
 }
 
 #[doc(hidden)]
