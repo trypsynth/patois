@@ -5,7 +5,6 @@ edition = "2024"
 description = "Build helper for patois: compiles .po translation files to .mo binaries and regenerates .pot templates."
 license = "MIT"
 keywords = ["i18n", "l10n", "build", "gettext"]
-categories = ["build-utils"]
 
 [dependencies]
 serde_json = "1.0.150"
