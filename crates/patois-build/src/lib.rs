@@ -57,6 +57,53 @@ fn run_msgfmt(input: &Path, output: &Path) {
 	}
 }
 
+/// Regenerate `<po_dir>/<package_name>.pot` from explicit source directories.
+///
+/// Unlike [`gen_pot`], this does not invoke `cargo` and is safe to call from a build script.
+/// Requires `xgettext` on `PATH`; returns `Err` (not a hard failure) if it is missing.
+pub fn gen_pot_from_dirs(
+	source_dirs: &[impl AsRef<Path>],
+	po_dir: impl AsRef<Path>,
+	package_name: &str,
+	package_version: &str,
+) -> Result<(), Box<dyn error::Error>> {
+	let po_dir = po_dir.as_ref();
+	if Command::new("xgettext").arg("--version").output().is_err() {
+		return Err("xgettext not found; install gettext tools".into());
+	}
+	let mut files: Vec<PathBuf> = Vec::new();
+	for dir in source_dirs {
+		collect_rust_files(dir.as_ref(), &mut files)?;
+	}
+	if files.is_empty() {
+		return Ok(());
+	}
+	fs::create_dir_all(po_dir)?;
+	let output_file = po_dir.join(format!("{package_name}.pot"));
+	let temp_file = po_dir.join(format!("{package_name}.pot.new"));
+	let mut cmd = Command::new("xgettext");
+	cmd.arg("--keyword=t")
+		.arg("--language=C")
+		.arg("--from-code=UTF-8")
+		.arg("--add-comments=TRANSLATORS")
+		.arg("--no-location")
+		.arg(format!("--package-name={package_name}"))
+		.arg(format!("--package-version={package_version}"))
+		.arg(format!("--output={}", temp_file.display()));
+	for file in &files {
+		cmd.arg(file);
+	}
+	if !cmd.status()?.success() {
+		return Err("xgettext failed".into());
+	}
+	if pot_changed(&output_file, &temp_file) {
+		fs::rename(&temp_file, &output_file)?;
+	} else {
+		fs::remove_file(&temp_file)?;
+	}
+	Ok(())
+}
+
 /// Regenerate `<po_dir>/<package_name>.pot` by scanning all workspace crates tagged with `[package.metadata.patois] translatable = true`.
 ///
 /// Pass the name of the primary package, used for the output filename, `--package-name`, and `--package-version` in the generated header. Requires `xgettext` and `cargo` on `PATH`.
