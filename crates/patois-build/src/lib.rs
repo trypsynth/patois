@@ -1,4 +1,5 @@
 use std::{
+	collections::HashSet,
 	env, error, fs,
 	path::{Path, PathBuf},
 	process::Command,
@@ -216,9 +217,9 @@ fn collect_source_files(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) -
 
 /// Extend an existing `.pot` file with strings from source files in the given directories.
 ///
-/// Uses `xgettext --join-existing` with `--keyword=t` and `--language=C`, which works for both
-/// Swift and Kotlin since both use C-like string literal syntax. Only files matching `extension`
-/// (e.g. `"swift"` or `"kt"`) are scanned. Requires `xgettext` on `PATH`.
+/// Scans files matching `extension` (e.g. `"swift"` or `"kt"`) for `t("...")` calls using a
+/// native Rust parser — no xgettext required. Handles standard C-style escape sequences in
+/// string literals and skips strings that are already present in the pot file.
 pub fn extend_pot_from_source_dirs(
 	dirs: &[impl AsRef<Path>],
 	extension: &str,
@@ -228,9 +229,6 @@ pub fn extend_pot_from_source_dirs(
 	if !pot_file.exists() {
 		return Ok(());
 	}
-	if Command::new("xgettext").arg("--version").output().is_err() {
-		return Err("xgettext not found; install gettext tools".into());
-	}
 	let mut files: Vec<PathBuf> = Vec::new();
 	for dir in dirs {
 		collect_source_files(dir.as_ref(), extension, &mut files)?;
@@ -238,20 +236,147 @@ pub fn extend_pot_from_source_dirs(
 	if files.is_empty() {
 		return Ok(());
 	}
-	let mut cmd = Command::new("xgettext");
-	cmd.arg("--keyword=t")
-		.arg("--language=C")
-		.arg("--from-code=UTF-8")
-		.arg("--join-existing")
-		.arg("--no-location")
-		.arg(format!("--output={}", pot_file.display()));
+
+	// Collect t("...") string literals from every source file, preserving first-seen order.
+	let mut new_strings: Vec<String> = Vec::new();
+	let mut seen_in_scan: HashSet<String> = HashSet::new();
 	for file in &files {
-		cmd.arg(file);
+		let content = fs::read_to_string(file)?;
+		for s in extract_t_strings(&content) {
+			if seen_in_scan.insert(s.clone()) {
+				new_strings.push(s);
+			}
+		}
 	}
-	if !cmd.status()?.success() {
-		return Err(format!("xgettext failed for {} sources", extension).into());
+	if new_strings.is_empty() {
+		return Ok(());
+	}
+
+	// Read the existing pot and collect msgids already present.
+	let existing = fs::read_to_string(pot_file)?;
+	let existing_ids = collect_pot_msgids(&existing);
+
+	// Append only truly new entries.
+	let mut additions = String::new();
+	for s in &new_strings {
+		if !existing_ids.contains(s) {
+			additions.push_str(&format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(s)));
+		}
+	}
+	if !additions.is_empty() {
+		let content = format!("{existing}{additions}");
+		fs::write(pot_file, content)?;
 	}
 	Ok(())
+}
+
+/// Extract every `t("literal")` value from `content`.
+///
+/// Handles standard C/Swift/Kotlin escape sequences (`\\`, `\"`, `\n`, `\t`). Ignores `t(` when
+/// preceded by an alphanumeric character or underscore (e.g. `stateDescription`).
+fn extract_t_strings(content: &str) -> Vec<String> {
+	let chars: Vec<char> = content.chars().collect();
+	let n = chars.len();
+	let mut out: Vec<String> = Vec::new();
+	let mut i = 0;
+	while i < n {
+		// Match `t(` not preceded by an identifier character.
+		if chars[i] == 't' && i + 1 < n && chars[i + 1] == '(' {
+			let preceded_by_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+			if !preceded_by_ident {
+				let mut j = i + 2;
+				while j < n && chars[j].is_ascii_whitespace() {
+					j += 1;
+				}
+				if j < n && chars[j] == '"' {
+					j += 1;
+					let mut s = String::new();
+					let mut valid = false;
+					'string: loop {
+						if j >= n {
+							break;
+						}
+						match chars[j] {
+							'"' => {
+								valid = true;
+								j += 1;
+								break 'string;
+							}
+							'\\' if j + 1 < n => {
+								j += 1;
+								match chars[j] {
+									'n' => s.push('\n'),
+									't' => s.push('\t'),
+									'"' => s.push('"'),
+									'\\' => s.push('\\'),
+									c => {
+										s.push('\\');
+										s.push(c);
+									}
+								}
+								j += 1;
+							}
+							'\n' | '\r' => break 'string, // unterminated
+							c => {
+								s.push(c);
+								j += 1;
+							}
+						}
+					}
+					if valid && !s.is_empty() {
+						out.push(s);
+					}
+					i = j;
+					continue;
+				}
+			}
+		}
+		i += 1;
+	}
+	out
+}
+
+/// Parse msgid values already present in a pot/po file.
+fn collect_pot_msgids(content: &str) -> HashSet<String> {
+	let mut ids: HashSet<String> = HashSet::new();
+	let mut current = String::new();
+	let mut in_msgid = false;
+	for line in content.lines() {
+		let line = line.trim();
+		if let Some(rest) = line.strip_prefix("msgid ") {
+			if !current.is_empty() {
+				ids.insert(std::mem::take(&mut current));
+			}
+			current = po_unescape(rest);
+			in_msgid = true;
+		} else if line.starts_with("msgstr ") {
+			if !current.is_empty() {
+				ids.insert(std::mem::take(&mut current));
+			}
+			in_msgid = false;
+		} else if in_msgid && line.starts_with('"') {
+			current.push_str(&po_unescape(line));
+		}
+	}
+	if !current.is_empty() {
+		ids.insert(current);
+	}
+	ids
+}
+
+/// Escape a string for use as a pot msgid value (between the outer double-quotes).
+fn pot_escape(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for c in s.chars() {
+		match c {
+			'"' => out.push_str("\\\""),
+			'\\' => out.push_str("\\\\"),
+			'\n' => out.push_str("\\n"),
+			'\t' => out.push_str("\\t"),
+			c => out.push(c),
+		}
+	}
+	out
 }
 
 /// Parse a gettext `.po` file and return `(msgid, msgstr)` pairs where `msgstr` is non-empty.
@@ -423,4 +548,63 @@ pub fn gen_android_strings(
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn extract_simple() {
+		assert_eq!(extract_t_strings(r#"Button(t("Cancel")) { dismiss() }"#), vec!["Cancel"]);
+	}
+
+	#[test]
+	fn extract_multiple() {
+		assert_eq!(extract_t_strings(r#"Text(t("Find")) Text(t("Cancel"))"#), vec!["Find", "Cancel"]);
+	}
+
+	#[test]
+	fn extract_escaped_quote() {
+		assert_eq!(extract_t_strings(r#"t("say \"hi\"")"#), vec!["say \"hi\""]);
+	}
+
+	#[test]
+	fn extract_backslash_escape() {
+		// Swift source on disk: t("Regular expression (\\1 = first capture group)")
+		// Two actual backslash chars in the file → decoded to one backslash in the msgid.
+		let src = "t(\"Regular expression (\\\\1 = first capture group)\")";
+		assert_eq!(extract_t_strings(src), vec!["Regular expression (\\1 = first capture group)"]);
+	}
+
+	#[test]
+	fn skip_ident_suffix_t() {
+		// 't' preceded by 'x' in putText → not a t() call
+		let src = r#"putText("bad") t("good")"#;
+		let got = extract_t_strings(src);
+		assert!(got.contains(&"good".to_string()));
+		assert!(!got.contains(&"bad".to_string()));
+	}
+
+	#[test]
+	fn unicode_passthrough() {
+		let src = "t(\"Search\u{2026}\")";
+		assert_eq!(extract_t_strings(src), vec!["Search\u{2026}"]);
+	}
+
+	#[test]
+	fn pot_escape_roundtrip() {
+		let s = "say \"hi\" and \\bye\nnewline";
+		let escaped = pot_escape(s);
+		assert_eq!(escaped, r#"say \"hi\" and \\bye\nnewline"#);
+		assert_eq!(po_unescape(&format!("\"{escaped}\"")), s);
+	}
+
+	#[test]
+	fn collect_msgids_finds_existing() {
+		let pot = "msgid \"\"\nmsgstr \"\"\n\nmsgid \"Cancel\"\nmsgstr \"\"\n\nmsgid \"OK\"\nmsgstr \"OK\"\n";
+		let ids = collect_pot_msgids(pot);
+		assert!(ids.contains("Cancel"));
+		assert!(ids.contains("OK"));
+	}
 }
