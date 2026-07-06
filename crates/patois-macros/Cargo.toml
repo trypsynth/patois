@@ -1,6 +1,6 @@
 [package]
 name = "patois-macros"
-version = "0.1.2"
+version = "0.2.0"
 description = "Proc macros for patois."
 edition = "2024"
 license = "MIT"

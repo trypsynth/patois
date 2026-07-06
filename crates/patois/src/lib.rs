@@ -22,12 +22,16 @@
 mod catalog;
 mod lang;
 mod registry;
+#[cfg(feature = "wx")]
+pub mod ui;
 
 use std::path::Path;
 
 pub use inventory;
 pub use lang::{LanguageInfo, LanguageManager, language_name};
 pub use patois_macros::embed_domain;
+#[cfg(feature = "wx")]
+pub use patois_macros::embed_wx_translations;
 
 /// Registered by [`embed_domain!`] for each library crate that embeds its locale files.
 ///
