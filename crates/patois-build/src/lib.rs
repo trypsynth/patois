@@ -100,6 +100,7 @@ pub fn gen_pot_from_dirs(
 	if !cmd.status()?.success() {
 		return Err("xgettext failed".into());
 	}
+	preserve_foreign_entries(&output_file, &temp_file)?;
 	if pot_changed(&output_file, &temp_file) {
 		fs::rename(&temp_file, &output_file)?;
 	} else {
@@ -170,6 +171,7 @@ pub fn gen_pot(
 	if !cmd.status()?.success() {
 		return Err("xgettext failed".into());
 	}
+	preserve_foreign_entries(&output_file, &temp_file)?;
 	if pot_changed(&output_file, &temp_file) {
 		fs::rename(&temp_file, &output_file)?;
 		println!("Updated {}", output_file.display());
@@ -206,6 +208,35 @@ fn pot_changed(old: &Path, new: &Path) -> bool {
 		Err(_) => return true,
 	};
 	strip_date(&old) != strip_date(&new)
+}
+
+/// Copy entries present in `old` but absent from `new` into `new`, appending them at the end.
+///
+/// `gen_pot`/`gen_pot_from_dirs` regenerate the `.pot` from a single language's sources (Rust),
+/// but callers often layer other languages on top afterward via
+/// [`extend_pot_from_source_dirs`] (e.g. iOS/Android). Without this step, the freshly
+/// regenerated file would always be missing those entries relative to the accumulated file on
+/// disk, so `pot_changed` would see a spurious difference and bump `POT-Creation-Date` on every
+/// single build even when no msgid actually changed.
+fn preserve_foreign_entries(old: &Path, new: &Path) -> Result<(), Box<dyn error::Error>> {
+	let Ok(old_content) = fs::read_to_string(old) else {
+		return Ok(());
+	};
+	let new_content = fs::read_to_string(new)?;
+	let new_ids = collect_pot_msgids(&new_content);
+	let mut additions = String::new();
+	let mut seen: HashSet<String> = HashSet::new();
+	for id in collect_pot_msgids_ordered(&old_content) {
+		if !new_ids.contains(&id) && seen.insert(id.clone()) {
+			additions.push_str(&format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(&id)));
+		}
+	}
+	if !additions.is_empty() {
+		let mut content = new_content;
+		content.push_str(&additions);
+		fs::write(new, content)?;
+	}
+	Ok(())
 }
 
 /// Collect source files with the given extension from a directory tree.
@@ -347,20 +378,25 @@ fn extract_t_strings(content: &str) -> Vec<String> {
 
 /// Parse msgid values already present in a pot/po file.
 fn collect_pot_msgids(content: &str) -> HashSet<String> {
-	let mut ids: HashSet<String> = HashSet::new();
+	collect_pot_msgids_ordered(content).into_iter().collect()
+}
+
+/// Parse msgid values already present in a pot/po file, preserving first-seen order.
+fn collect_pot_msgids_ordered(content: &str) -> Vec<String> {
+	let mut ids: Vec<String> = Vec::new();
 	let mut current = String::new();
 	let mut in_msgid = false;
 	for line in content.lines() {
 		let line = line.trim();
 		if let Some(rest) = line.strip_prefix("msgid ") {
 			if !current.is_empty() {
-				ids.insert(std::mem::take(&mut current));
+				ids.push(std::mem::take(&mut current));
 			}
 			current = po_unescape(rest);
 			in_msgid = true;
 		} else if line.starts_with("msgstr ") {
 			if !current.is_empty() {
-				ids.insert(std::mem::take(&mut current));
+				ids.push(std::mem::take(&mut current));
 			}
 			in_msgid = false;
 		} else if in_msgid && line.starts_with('"') {
@@ -368,7 +404,7 @@ fn collect_pot_msgids(content: &str) -> HashSet<String> {
 		}
 	}
 	if !current.is_empty() {
-		ids.insert(current);
+		ids.push(current);
 	}
 	ids
 }
