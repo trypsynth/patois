@@ -76,6 +76,9 @@ pub fn gen_pot_from_dirs(
 	for dir in source_dirs {
 		collect_rust_files(dir.as_ref(), &mut files)?;
 	}
+	// See the comment in `gen_pot`: sort for a deterministic xgettext file order, so
+	// pot_changed's comparison isn't fooled by an incidental reordering.
+	files.sort();
 	if files.is_empty() {
 		return Ok(());
 	}
@@ -135,6 +138,12 @@ pub fn gen_pot(
 		let src = Path::new(manifest).parent().unwrap().join("src");
 		collect_rust_files(&src, &mut files)?;
 	}
+	// `fs::read_dir` order isn't guaranteed stable across runs, and neither is `cargo
+	// metadata`'s package ordering — sort so the file list (and therefore xgettext's output)
+	// is deterministic. Otherwise the .pot content can reorder from run to run even when the
+	// actual string set hasn't changed, defeating pot_changed's comparison below and causing
+	// spurious rewrites (with a fresh POT-Creation-Date) on every build.
+	files.sort();
 	if files.is_empty() {
 		return Err("no translatable source files found — check [package.metadata.patois] translatable = true".into());
 	}
