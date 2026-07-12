@@ -74,11 +74,17 @@ pub fn gen_pot_from_dirs(
 	}
 	let mut files: Vec<PathBuf> = Vec::new();
 	for dir in source_dirs {
-		collect_rust_files(dir.as_ref(), &mut files)?;
+		// Sort within each directory (safe: paths share a common prefix, so absolute-path
+		// order matches relative order on every machine) rather than sorting the combined
+		// list (unsafe: `source_dirs` entries can resolve to unrelated absolute locations,
+		// e.g. one under the project checkout and one under a dependency's cache, whose
+		// relative order then depends on incidental, machine-specific path spelling like
+		// `.cargo` vs `scoop`). See the longer comment in `gen_pot`.
+		let mut dir_files: Vec<PathBuf> = Vec::new();
+		collect_rust_files(dir.as_ref(), &mut dir_files)?;
+		dir_files.sort();
+		files.extend(dir_files);
 	}
-	// See the comment in `gen_pot`: sort for a deterministic xgettext file order, so
-	// pot_changed's comparison isn't fooled by an incidental reordering.
-	files.sort();
 	if files.is_empty() {
 		return Ok(());
 	}
@@ -129,22 +135,33 @@ pub fn gen_pot(
 		return Err("cargo metadata failed".into());
 	}
 	let meta: serde_json::Value = serde_json::from_slice(&meta_output.stdout)?;
-	let packages = meta["packages"].as_array().ok_or("cargo metadata: missing packages")?;
+	let mut packages: Vec<&serde_json::Value> =
+		meta["packages"].as_array().ok_or("cargo metadata: missing packages")?.iter().collect();
+	// `fs::read_dir` order isn't guaranteed stable across runs, and neither is `cargo
+	// metadata`'s package ordering — sort packages by name (not filesystem path: a package's
+	// manifest_path can resolve under the project checkout for one contributor and under
+	// their CARGO_HOME's registry/git cache for another, e.g. `.cargo` vs `scoop`, or `git` vs
+	// `pb`, and those absolute prefixes sort differently from machine to machine) so package
+	// order is deterministic and independent of where things happen to live on disk.
+	packages.sort_by_key(|pkg| pkg["name"].as_str().unwrap_or_default().to_string());
 	let mut files: Vec<PathBuf> = Vec::new();
-	for pkg in packages {
+	for pkg in &packages {
 		if pkg["metadata"]["patois"]["translatable"] != true {
 			continue;
 		}
 		let manifest = pkg["manifest_path"].as_str().ok_or("cargo metadata: missing manifest_path")?;
 		let src = Path::new(manifest).parent().unwrap().join("src");
-		collect_rust_files(&src, &mut files)?;
+		// Sort each package's own files by absolute path — safe here since they all share
+		// that package's src root as a common prefix, so relative order is stable across
+		// machines even though the shared prefix itself isn't. This is what keeps the file
+		// list (and therefore xgettext's output) deterministic between runs, so pot_changed's
+		// comparison below isn't fooled by incidental reordering into a spurious rewrite (with
+		// a fresh POT-Creation-Date) on every build.
+		let mut pkg_files: Vec<PathBuf> = Vec::new();
+		collect_rust_files(&src, &mut pkg_files)?;
+		pkg_files.sort();
+		files.extend(pkg_files);
 	}
-	// `fs::read_dir` order isn't guaranteed stable across runs, and neither is `cargo
-	// metadata`'s package ordering — sort so the file list (and therefore xgettext's output)
-	// is deterministic. Otherwise the .pot content can reorder from run to run even when the
-	// actual string set hasn't changed, defeating pot_changed's comparison below and causing
-	// spurious rewrites (with a fresh POT-Creation-Date) on every build.
-	files.sort();
 	if files.is_empty() {
 		return Err("no translatable source files found — check [package.metadata.patois] translatable = true".into());
 	}
