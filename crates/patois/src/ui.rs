@@ -1,5 +1,5 @@
 //! wxWidgets-specific helpers for apps that use `patois` for translations, gated behind
-//! the `wx` feature. Generalizes the patois+wxDragon wiring an app would otherwise have to
+//! the `ui` feature. Generalizes the patois+wxDragon wiring an app would otherwise have to
 //! reimplement itself: activating a locale (both the app's own catalog and wxWidgets' own
 //! `wxstd` UI strings via [`crate::embed_wx_translations!`]), and populating a language
 //! selector control.

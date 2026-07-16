@@ -49,7 +49,7 @@ pub fn embed_domain(_input: TokenStream) -> TokenStream {
 /// Embed wxWidgets' own standard message catalogs (`wxstd`) for whichever languages this
 /// crate already ships — i.e. present under `<crate_root>/locale/`, the same directory
 /// [`embed_domain!`] reads. Call once at module level in an app crate that depends on
-/// `patois` with the `wx` feature and on `wxdragon` directly.
+/// `patois` with the `ui` feature and on `wxdragon` directly.
 ///
 /// wxWidgets ships translations for its own built-in UI strings ("OK", "Cancel",
 /// progress-dialog labels, etc.) as gettext `.mo` files, produced by the `wxdragon-sys`

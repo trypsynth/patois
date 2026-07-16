@@ -2,8 +2,8 @@
 members = ["crates/patois", "crates/patois-build", "crates/patois-macros"]
 resolver = "2"
 
-# The `wx` feature on patois needs wxdragon's `Translations::set_loader`/`TranslationsLoader`,
+# The `ui` feature on patois needs wxdragon's `Translations::set_loader`/`TranslationsLoader`,
 # which aren't in a crates.io release yet. Matches the same patch paperback's own workspace
-# carries so `cargo build -p patois --features wx` works standalone too.
+# carries so `cargo build -p patois --features ui` works standalone too.
 [patch.crates-io]
 wxdragon = { git = "https://github.com/AllenDang/wxDragon", branch = "main" }
