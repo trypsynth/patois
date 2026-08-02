@@ -11,7 +11,7 @@ categories = ["localization", "internationalization"]
 inventory = "0.3.24"
 patois-macros = { version = "0.2.0", path = "../patois-macros" }
 sys-locale = "0.3.2"
-wxdragon = { version = "0.9.17", optional = true }
+wxdragon = { version = "0.9.18", optional = true }
 
 [features]
 ui = ["dep:wxdragon"]
