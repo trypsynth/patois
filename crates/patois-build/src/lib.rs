@@ -98,7 +98,6 @@ pub fn gen_pot_from_dirs(
 		.arg("--add-comments=TRANSLATORS")
 		.arg("--no-location")
 		.arg("--no-wrap")
-		.arg("--flag=t:1:no-c-format")
 		.arg(format!("--package-name={package_name}"))
 		.arg(format!("--package-version={package_version}"))
 		.arg(format!("--output={}", temp_file.display()));
@@ -108,6 +107,7 @@ pub fn gen_pot_from_dirs(
 	if !cmd.status()?.success() {
 		return Err("xgettext failed".into());
 	}
+	strip_format_flags(&temp_file)?;
 	preserve_foreign_entries(&output_file, &temp_file)?;
 	if pot_changed(&output_file, &temp_file) {
 		fs::rename(&temp_file, &output_file)?;
@@ -182,7 +182,6 @@ pub fn gen_pot(
 		.arg("--add-comments=TRANSLATORS")
 		.arg("--no-location")
 		.arg("--no-wrap")
-		.arg("--flag=t:1:no-c-format")
 		.arg(format!("--package-name={package_name}"))
 		.arg(format!("--package-version={version}"))
 		.arg(format!("--output={}", temp_file.display()));
@@ -192,6 +191,7 @@ pub fn gen_pot(
 	if !cmd.status()?.success() {
 		return Err("xgettext failed".into());
 	}
+	strip_format_flags(&temp_file)?;
 	preserve_foreign_entries(&output_file, &temp_file)?;
 	if pot_changed(&output_file, &temp_file) {
 		fs::rename(&temp_file, &output_file)?;
@@ -215,6 +215,35 @@ fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dy
 			files.push(path);
 		}
 	}
+	Ok(())
+}
+
+/// Strips `c-format`/`no-c-format` flags that `xgettext`'s built-in heuristic attaches to `#,`
+/// comment lines based on scanning each msgid for `%`-style directives. Whether a given msgid
+/// gets flagged is a heuristic guess that differs across `xgettext` versions and platforms
+/// (confirmed: the same source produced different flags on different machines), and nothing
+/// in typical downstream tooling (`msgfmt --check-format`, custom placeholder validation)
+/// necessarily reads this flag, so keeping it around only adds version-dependent churn to the
+/// generated file for no guaranteed benefit. Leaves other flags (e.g. `fuzzy`) untouched.
+fn strip_format_flags(path: &Path) -> Result<(), Box<dyn error::Error>> {
+	let content = fs::read_to_string(path)?;
+	let mut out = String::with_capacity(content.len());
+	for line in content.lines() {
+		if let Some(rest) = line.strip_prefix("#,") {
+			let kept: Vec<&str> =
+				rest.split(',').map(str::trim).filter(|flag| *flag != "c-format" && *flag != "no-c-format").collect();
+			if kept.is_empty() {
+				continue;
+			}
+			out.push_str("#, ");
+			out.push_str(&kept.join(", "));
+			out.push('\n');
+			continue;
+		}
+		out.push_str(line);
+		out.push('\n');
+	}
+	fs::write(path, out)?;
 	Ok(())
 }
 
@@ -641,6 +670,36 @@ mod tests {
 		// Two actual backslash chars in the file → decoded to one backslash in the msgid.
 		let src = "t(\"Regular expression (\\\\1 = first capture group)\")";
 		assert_eq!(extract_t_strings(src), vec!["Regular expression (\\1 = first capture group)"]);
+	}
+
+	#[test]
+	fn strip_format_flags_drops_c_format_lines_but_keeps_other_flags() {
+		let content = "\
+#. a comment
+#, c-format
+msgid \"Page %d\"
+msgstr \"\"
+
+#, fuzzy, c-format
+msgid \"Old %s\"
+msgstr \"\"
+
+#, fuzzy
+msgid \"Cancel\"
+msgstr \"\"
+
+msgid \"No flags here\"
+msgstr \"\"
+";
+		let path = env::temp_dir().join(format!("patois-build-strip-format-flags-test-{}.pot", std::process::id()));
+		fs::write(&path, content).unwrap();
+		strip_format_flags(&path).unwrap();
+		let result = fs::read_to_string(&path).unwrap();
+		fs::remove_file(&path).unwrap();
+		assert!(!result.contains("c-format"));
+		assert!(result.contains("#, fuzzy\nmsgid \"Old %s\""));
+		assert!(result.contains("#, fuzzy\nmsgid \"Cancel\""));
+		assert!(result.contains("msgid \"No flags here\""));
 	}
 
 	#[test]
