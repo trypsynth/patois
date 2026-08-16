@@ -97,6 +97,8 @@ pub fn gen_pot_from_dirs(
 		.arg("--from-code=UTF-8")
 		.arg("--add-comments=TRANSLATORS")
 		.arg("--no-location")
+		.arg("--no-wrap")
+		.arg("--flag=t:1:no-c-format")
 		.arg(format!("--package-name={package_name}"))
 		.arg(format!("--package-version={package_version}"))
 		.arg(format!("--output={}", temp_file.display()));
@@ -179,6 +181,8 @@ pub fn gen_pot(
 		.arg("--from-code=UTF-8")
 		.arg("--add-comments=TRANSLATORS")
 		.arg("--no-location")
+		.arg("--no-wrap")
+		.arg("--flag=t:1:no-c-format")
 		.arg(format!("--package-name={package_name}"))
 		.arg(format!("--package-version={version}"))
 		.arg(format!("--output={}", temp_file.display()));
