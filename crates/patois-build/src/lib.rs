@@ -5,6 +5,8 @@ use std::{
 	process::Command,
 };
 
+pub mod po;
+
 /// Compile all `.po` files in `po_dir` into `.mo` files under `locale_dir`.
 ///
 /// Output path for each language: `<locale_dir>/<lang>/LC_MESSAGES/<domain>.mo` where `<domain>` is the crate name (`CARGO_PKG_NAME`).
@@ -552,49 +554,12 @@ fn pot_escape(s: &str) -> String {
 
 /// Parse a gettext `.po` file and return `(msgid, msgstr)` pairs where `msgstr` is non-empty.
 fn parse_po_entries(content: &str) -> Vec<(String, String)> {
-	let mut entries: Vec<(String, String)> = Vec::new();
-	let mut msgid = String::new();
-	let mut msgstr = String::new();
-	let mut in_msgid = false;
-	let mut in_msgstr = false;
-	let mut pending_id: Option<String> = None;
-
-	let flush = |pending_id: &mut Option<String>, msgstr: &mut String, entries: &mut Vec<(String, String)>| {
-		if let Some(id) = pending_id.take() {
-			if !id.is_empty() && !msgstr.is_empty() {
-				entries.push((id, std::mem::take(msgstr)));
-			} else {
-				msgstr.clear();
-			}
-		}
-	};
-
-	for line in content.lines() {
-		let line = line.trim();
-		if let Some(rest) = line.strip_prefix("msgid ") {
-			flush(&mut pending_id, &mut msgstr, &mut entries);
-			msgid = po_unescape(rest);
-			in_msgid = true;
-			in_msgstr = false;
-		} else if let Some(rest) = line.strip_prefix("msgstr ") {
-			pending_id = Some(std::mem::take(&mut msgid));
-			msgstr = po_unescape(rest);
-			in_msgid = false;
-			in_msgstr = true;
-		} else if line.starts_with('"') {
-			let cont = po_unescape(line);
-			if in_msgid {
-				msgid.push_str(&cont);
-			} else if in_msgstr {
-				msgstr.push_str(&cont);
-			}
-		} else if line.is_empty() || line.starts_with('#') {
-			in_msgid = false;
-			in_msgstr = false;
-		}
-	}
-	flush(&mut pending_id, &mut msgstr, &mut entries);
-	entries
+	po::PoDocument::parse(content)
+		.entries
+		.into_iter()
+		.filter(|e| !e.msgstr.is_empty())
+		.map(|e| (e.msgid, e.msgstr))
+		.collect()
 }
 
 fn po_unescape(s: &str) -> String {
