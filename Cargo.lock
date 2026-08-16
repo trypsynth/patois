@@ -722,7 +722,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "patois"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "inventory",
  "patois-macros",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "patois-build"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
 ]

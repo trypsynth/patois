@@ -21,6 +21,7 @@
 
 mod catalog;
 mod lang;
+mod plural;
 mod registry;
 #[cfg(feature = "ui")]
 pub mod ui;

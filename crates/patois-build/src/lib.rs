@@ -93,6 +93,7 @@ pub fn gen_pot_from_dirs(
 	let temp_file = po_dir.join(format!("{package_name}.pot.new"));
 	let mut cmd = Command::new("xgettext");
 	cmd.arg("--keyword=t")
+		.arg("--keyword=nt:1,2")
 		.arg("--language=C")
 		.arg("--from-code=UTF-8")
 		.arg("--add-comments=TRANSLATORS")
@@ -177,6 +178,7 @@ pub fn gen_pot(
 	let temp_file = po_dir.join(format!("{package_name}.pot.new"));
 	let mut cmd = Command::new("xgettext");
 	cmd.arg("--keyword=t")
+		.arg("--keyword=nt:1,2")
 		.arg("--language=C")
 		.arg("--from-code=UTF-8")
 		.arg("--add-comments=TRANSLATORS")
@@ -276,9 +278,9 @@ fn preserve_foreign_entries(old: &Path, new: &Path) -> Result<(), Box<dyn error:
 	let new_ids = collect_pot_msgids(&new_content);
 	let mut additions = String::new();
 	let mut seen: HashSet<String> = HashSet::new();
-	for id in collect_pot_msgids_ordered(&old_content) {
-		if !new_ids.contains(&id) && seen.insert(id.clone()) {
-			additions.push_str(&format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(&id)));
+	for entry in collect_pot_entries_ordered(&old_content) {
+		if !new_ids.contains(&entry.msgid) && seen.insert(entry.msgid.clone()) {
+			additions.push_str(&pot_entry_block(&entry));
 		}
 	}
 	if !additions.is_empty() {
@@ -307,9 +309,10 @@ fn collect_source_files(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) -
 
 /// Extend an existing `.pot` file with strings from source files in the given directories.
 ///
-/// Scans files matching `extension` (e.g. `"swift"` or `"kt"`) for `t("...")` calls using a
-/// native Rust parser — no xgettext required. Handles standard C-style escape sequences in
-/// string literals and skips strings that are already present in the pot file.
+/// Scans files matching `extension` (e.g. `"swift"` or `"kt"`) for `t("...")` and
+/// `nt("...", "...", ...)` calls using a native Rust parser, no xgettext required. Handles
+/// standard C-style escape sequences in string literals and skips strings that are already
+/// present in the pot file.
 pub fn extend_pot_from_source_dirs(
 	dirs: &[impl AsRef<Path>],
 	extension: &str,
@@ -327,18 +330,25 @@ pub fn extend_pot_from_source_dirs(
 		return Ok(());
 	}
 
-	// Collect t("...") string literals from every source file, preserving first-seen order.
-	let mut new_strings: Vec<String> = Vec::new();
+	// Collect t("...")/nt("...", "...") calls from every source file, preserving first-seen
+	// order. Both share one "seen" set keyed on the singular text so the same string can't be
+	// added twice even if it turns up as both a t() and an nt() call somewhere.
+	let mut new_entries: Vec<PotEntry> = Vec::new();
 	let mut seen_in_scan: HashSet<String> = HashSet::new();
 	for file in &files {
 		let content = fs::read_to_string(file)?;
 		for s in extract_t_strings(&content) {
 			if seen_in_scan.insert(s.clone()) {
-				new_strings.push(s);
+				new_entries.push(PotEntry { msgid: s, msgid_plural: None });
+			}
+		}
+		for (singular, plural) in extract_nt_strings(&content) {
+			if seen_in_scan.insert(singular.clone()) {
+				new_entries.push(PotEntry { msgid: singular, msgid_plural: Some(plural) });
 			}
 		}
 	}
-	if new_strings.is_empty() {
+	if new_entries.is_empty() {
 		return Ok(());
 	}
 
@@ -348,9 +358,9 @@ pub fn extend_pot_from_source_dirs(
 
 	// Append only truly new entries.
 	let mut additions = String::new();
-	for s in &new_strings {
-		if !existing_ids.contains(s) {
-			additions.push_str(&format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(s)));
+	for entry in &new_entries {
+		if !existing_ids.contains(&entry.msgid) {
+			additions.push_str(&pot_entry_block(entry));
 		}
 	}
 	if !additions.is_empty() {
@@ -360,63 +370,95 @@ pub fn extend_pot_from_source_dirs(
 	Ok(())
 }
 
+/// Reads a `"..."` string literal starting at `pos` (may point at whitespace before the
+/// opening quote). Returns the decoded string and the index just past the closing quote, or
+/// `None` if there's no quote there, or the literal is never terminated (hits a raw newline or
+/// end of input first). Handles standard C/Swift/Kotlin escapes (`\\`, `\"`, `\n`, `\t`).
+fn read_string_literal(chars: &[char], mut pos: usize) -> Option<(String, usize)> {
+	let n = chars.len();
+	while pos < n && chars[pos].is_ascii_whitespace() {
+		pos += 1;
+	}
+	if pos >= n || chars[pos] != '"' {
+		return None;
+	}
+	pos += 1;
+	let mut s = String::new();
+	loop {
+		if pos >= n {
+			return None;
+		}
+		match chars[pos] {
+			'"' => return Some((s, pos + 1)),
+			'\\' if pos + 1 < n => {
+				pos += 1;
+				match chars[pos] {
+					'n' => s.push('\n'),
+					't' => s.push('\t'),
+					'"' => s.push('"'),
+					'\\' => s.push('\\'),
+					c => {
+						s.push('\\');
+						s.push(c);
+					}
+				}
+				pos += 1;
+			}
+			'\n' | '\r' => return None,
+			c => {
+				s.push(c);
+				pos += 1;
+			}
+		}
+	}
+}
+
 /// Extract every `t("literal")` value from `content`.
 ///
-/// Handles standard C/Swift/Kotlin escape sequences (`\\`, `\"`, `\n`, `\t`). Ignores `t(` when
-/// preceded by an alphanumeric character or underscore (e.g. `stateDescription`).
+/// Ignores `t(` when preceded by an alphanumeric character or underscore (e.g.
+/// `stateDescription`).
 fn extract_t_strings(content: &str) -> Vec<String> {
 	let chars: Vec<char> = content.chars().collect();
 	let n = chars.len();
 	let mut out: Vec<String> = Vec::new();
 	let mut i = 0;
 	while i < n {
-		// Match `t(` not preceded by an identifier character.
 		if chars[i] == 't' && i + 1 < n && chars[i + 1] == '(' {
 			let preceded_by_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
-			if !preceded_by_ident {
-				let mut j = i + 2;
-				while j < n && chars[j].is_ascii_whitespace() {
+			if !preceded_by_ident && let Some((s, next)) = read_string_literal(&chars, i + 2) {
+				if !s.is_empty() {
+					out.push(s);
+				}
+				i = next;
+				continue;
+			}
+		}
+		i += 1;
+	}
+	out
+}
+
+/// Extract every `nt("singular", "plural", ...)` call's singular/plural literal pair from
+/// `content`. Ignores the third (count) argument entirely; only the first two string literals
+/// matter. Same identifier-boundary rule as [`extract_t_strings`].
+fn extract_nt_strings(content: &str) -> Vec<(String, String)> {
+	let chars: Vec<char> = content.chars().collect();
+	let n = chars.len();
+	let mut out: Vec<(String, String)> = Vec::new();
+	let mut i = 0;
+	while i < n {
+		if chars[i] == 'n' && i + 1 < n && chars[i + 1] == 't' && i + 2 < n && chars[i + 2] == '(' {
+			let preceded_by_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+			if !preceded_by_ident && let Some((singular, after_singular)) = read_string_literal(&chars, i + 3) {
+				let mut j = after_singular;
+				while j < n && (chars[j].is_ascii_whitespace() || chars[j] == ',') {
 					j += 1;
 				}
-				if j < n && chars[j] == '"' {
-					j += 1;
-					let mut s = String::new();
-					let mut valid = false;
-					'string: loop {
-						if j >= n {
-							break;
-						}
-						match chars[j] {
-							'"' => {
-								valid = true;
-								j += 1;
-								break 'string;
-							}
-							'\\' if j + 1 < n => {
-								j += 1;
-								match chars[j] {
-									'n' => s.push('\n'),
-									't' => s.push('\t'),
-									'"' => s.push('"'),
-									'\\' => s.push('\\'),
-									c => {
-										s.push('\\');
-										s.push(c);
-									}
-								}
-								j += 1;
-							}
-							'\n' | '\r' => break 'string, // unterminated
-							c => {
-								s.push(c);
-								j += 1;
-							}
-						}
+				if let Some((plural, after_plural)) = read_string_literal(&chars, j) {
+					if !singular.is_empty() && !plural.is_empty() {
+						out.push((singular, plural));
 					}
-					if valid && !s.is_empty() {
-						out.push(s);
-					}
-					i = j;
+					i = after_plural;
 					continue;
 				}
 			}
@@ -426,37 +468,71 @@ fn extract_t_strings(content: &str) -> Vec<String> {
 	out
 }
 
-/// Parse msgid values already present in a pot/po file.
-fn collect_pot_msgids(content: &str) -> HashSet<String> {
-	collect_pot_msgids_ordered(content).into_iter().collect()
+/// A parsed pot/po entry: a msgid, and its msgid_plural text if it's a plural entry.
+struct PotEntry {
+	msgid: String,
+	msgid_plural: Option<String>,
 }
 
-/// Parse msgid values already present in a pot/po file, preserving first-seen order.
-fn collect_pot_msgids_ordered(content: &str) -> Vec<String> {
-	let mut ids: Vec<String> = Vec::new();
-	let mut current = String::new();
+/// Renders a `PotEntry` as the block of lines to append to a pot file (blank msgstr(s), ready
+/// for `msgmerge` or a translator to fill in).
+fn pot_entry_block(entry: &PotEntry) -> String {
+	match &entry.msgid_plural {
+		Some(plural) => format!(
+			"\nmsgid \"{}\"\nmsgid_plural \"{}\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
+			pot_escape(&entry.msgid),
+			pot_escape(plural)
+		),
+		None => format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(&entry.msgid)),
+	}
+}
+
+/// Parse msgid values already present in a pot/po file.
+fn collect_pot_msgids(content: &str) -> HashSet<String> {
+	collect_pot_entries_ordered(content).into_iter().map(|e| e.msgid).collect()
+}
+
+/// Parse msgid/msgid_plural entries already present in a pot/po file, preserving first-seen
+/// order.
+fn collect_pot_entries_ordered(content: &str) -> Vec<PotEntry> {
+	let mut entries: Vec<PotEntry> = Vec::new();
+	let mut current_id = String::new();
+	let mut current_plural: Option<String> = None;
 	let mut in_msgid = false;
+	let mut in_msgid_plural = false;
+	let flush = |current_id: &mut String, current_plural: &mut Option<String>, entries: &mut Vec<PotEntry>| {
+		if !current_id.is_empty() || current_plural.is_some() {
+			entries.push(PotEntry { msgid: std::mem::take(current_id), msgid_plural: current_plural.take() });
+		}
+	};
 	for line in content.lines() {
 		let line = line.trim();
-		if let Some(rest) = line.strip_prefix("msgid ") {
-			if !current.is_empty() {
-				ids.push(std::mem::take(&mut current));
-			}
-			current = po_unescape(rest);
-			in_msgid = true;
-		} else if line.starts_with("msgstr ") {
-			if !current.is_empty() {
-				ids.push(std::mem::take(&mut current));
-			}
+		if let Some(rest) = line.strip_prefix("msgid_plural ") {
+			current_plural = Some(po_unescape(rest));
 			in_msgid = false;
-		} else if in_msgid && line.starts_with('"') {
-			current.push_str(&po_unescape(line));
+			in_msgid_plural = true;
+		} else if let Some(rest) = line.strip_prefix("msgid ") {
+			flush(&mut current_id, &mut current_plural, &mut entries);
+			current_id = po_unescape(rest);
+			in_msgid = true;
+			in_msgid_plural = false;
+		} else if line.starts_with("msgstr") {
+			// Covers both a plain entry's `msgstr "..."` and a plural entry's `msgstr[N] "..."`.
+			flush(&mut current_id, &mut current_plural, &mut entries);
+			in_msgid = false;
+			in_msgid_plural = false;
+		} else if line.starts_with('"') {
+			if in_msgid_plural {
+				if let Some(p) = current_plural.as_mut() {
+					p.push_str(&po_unescape(line));
+				}
+			} else if in_msgid {
+				current_id.push_str(&po_unescape(line));
+			}
 		}
 	}
-	if !current.is_empty() {
-		ids.push(current);
-	}
-	ids
+	flush(&mut current_id, &mut current_plural, &mut entries);
+	entries
 }
 
 /// Escape a string for use as a pot msgid value (between the outer double-quotes).
@@ -731,5 +807,51 @@ msgstr \"\"
 		let ids = collect_pot_msgids(pot);
 		assert!(ids.contains("Cancel"));
 		assert!(ids.contains("OK"));
+	}
+
+	#[test]
+	fn extract_nt_finds_singular_and_plural() {
+		let src = r#"Text(nt("{} result", "{} results", count))"#;
+		assert_eq!(extract_nt_strings(src), vec![("{} result".to_string(), "{} results".to_string())]);
+	}
+
+	#[test]
+	fn extract_nt_ignores_nt_suffix() {
+		// 'nt' preceded by 'x' in xnt(...) → not an nt() call.
+		let src = r#"xnt("bad", "worse", n) nt("good", "goods", n)"#;
+		assert_eq!(extract_nt_strings(src), vec![("good".to_string(), "goods".to_string())]);
+	}
+
+	#[test]
+	fn collect_pot_entries_captures_plural_shape() {
+		let pot = "msgid \"\"\nmsgstr \"\"\n\nmsgid \"{} result\"\nmsgid_plural \"{} results\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n\nmsgid \"Cancel\"\nmsgstr \"\"\n";
+		let entries = collect_pot_entries_ordered(pot);
+		let plural_entry = entries.iter().find(|e| e.msgid == "{} result").unwrap();
+		assert_eq!(plural_entry.msgid_plural.as_deref(), Some("{} results"));
+		let singular_entry = entries.iter().find(|e| e.msgid == "Cancel").unwrap();
+		assert_eq!(singular_entry.msgid_plural, None);
+	}
+
+	#[test]
+	fn preserve_foreign_entries_keeps_plural_entries_intact() {
+		let dir = env::temp_dir().join(format!("patois-build-preserve-plural-test-{}", std::process::id()));
+		fs::create_dir_all(&dir).unwrap();
+		let old = dir.join("old.pot");
+		let new = dir.join("new.pot");
+		// The old pot has a plural entry that the fresh xgettext scan (simulated by `new`)
+		// no longer produced, e.g. because gap 1 (missing --keyword=nt:1,2) meant it was
+		// hand-added and would otherwise get flattened on the next regeneration.
+		fs::write(
+			&old,
+			"msgid \"\"\nmsgstr \"\"\n\nmsgid \"{} result\"\nmsgid_plural \"{} results\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
+		)
+		.unwrap();
+		fs::write(&new, "msgid \"\"\nmsgstr \"\"\n").unwrap();
+		preserve_foreign_entries(&old, &new).unwrap();
+		let result = fs::read_to_string(&new).unwrap();
+		fs::remove_dir_all(&dir).unwrap();
+		assert!(result.contains("msgid \"{} result\"\nmsgid_plural \"{} results\""));
+		assert!(result.contains("msgstr[0] \"\""));
+		assert!(result.contains("msgstr[1] \"\""));
 	}
 }

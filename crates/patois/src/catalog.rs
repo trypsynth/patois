@@ -4,12 +4,15 @@ use std::{
 	str,
 };
 
+use crate::plural::PluralRule;
+
 const MAGIC_LE: u32 = 0x9504_12DE;
 const MAGIC_BE: u32 = 0xDE12_0495;
 
 /// A parsed gettext .mo catalog.
 pub(crate) struct Catalog {
 	translations: HashMap<String, Vec<String>>,
+	plural_rule: Option<PluralRule>,
 }
 
 impl Catalog {
@@ -27,11 +30,23 @@ impl Catalog {
 
 	/// Look up a plural translation.
 	///
-	/// Uses a simplified English plural rule (n == 1 form 0, else form 1) when no plural-rule expression is stored. Full CLDR plural rules are a future enhancement.
+	/// Uses the catalog's own `Plural-Forms` rule (parsed from the .mo header) when present, so
+	/// languages with more than two forms (e.g. Slavic, Arabic) select the right one. Falls back
+	/// to a simplified English-style rule (n == 1 form 0, else form 1) when the header has no
+	/// rule or it fails to parse.
 	pub fn ngettext<'a>(&'a self, singular: &'a str, plural: &'a str, n: u64) -> &'a str {
 		match self.translations.get(singular) {
 			Some(forms) => {
-				let idx = if n == 1 { 0 } else { forms.len().saturating_sub(1).min(1) };
+				let idx = match &self.plural_rule {
+					Some(rule) => rule.index_for(n).min(forms.len().saturating_sub(1)),
+					None => {
+						if n == 1 {
+							0
+						} else {
+							forms.len().saturating_sub(1).min(1)
+						}
+					}
+				};
 				forms.get(idx).map(String::as_str).unwrap_or(if n == 1 { singular } else { plural })
 			}
 			None => {
@@ -63,6 +78,7 @@ fn parse_mo(data: &[u8]) -> Option<Catalog> {
 	let orig_table = u32_at(12)? as usize;
 	let trans_table = u32_at(16)? as usize;
 	let mut translations: HashMap<String, Vec<String>> = HashMap::with_capacity(n);
+	let mut plural_rule = None;
 	for i in 0..n {
 		let orig_len = u32_at(orig_table + i * 8)? as usize;
 		let orig_off = u32_at(orig_table + i * 8 + 4)? as usize;
@@ -74,7 +90,14 @@ fn parse_mo(data: &[u8]) -> Option<Catalog> {
 		let val = str::from_utf8(val_bytes).ok()?;
 		// Plural forms: key is "singular\0plural", val is "form0\0form1\0..." We key the map on the singular msgid.
 		let singular = key.split('\0').next()?;
-		if singular.is_empty() || val.is_empty() {
+		if singular.is_empty() {
+			// The header entry: its "translation" is a block of "Key: value\n" metadata lines,
+			// not a real msgstr, so it never goes into `translations`. Pull the Plural-Forms
+			// rule out of it instead of discarding it outright.
+			plural_rule = PluralRule::parse_from_header(val);
+			continue;
+		}
+		if val.is_empty() {
 			continue;
 		}
 		let forms: Vec<String> = val.split('\0').filter(|s| !s.is_empty()).map(String::from).collect();
@@ -82,7 +105,7 @@ fn parse_mo(data: &[u8]) -> Option<Catalog> {
 			translations.insert(singular.to_string(), forms);
 		}
 	}
-	Some(Catalog { translations })
+	Some(Catalog { translations, plural_rule })
 }
 
 #[cfg(test)]
@@ -150,5 +173,24 @@ mod tests {
 		let cat = Catalog::parse(Cursor::new(mo)).unwrap();
 		assert_eq!(cat.ngettext("item", "items", 1), "item");
 		assert_eq!(cat.ngettext("item", "items", 5), "items");
+	}
+
+	#[test]
+	fn header_plural_forms_rule_picks_the_right_form() {
+		let header = "Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n";
+		let mo = make_mo(&[("", header), ("apple\0apples", "one\0few\0many")]);
+		let cat = Catalog::parse(Cursor::new(mo)).unwrap();
+		assert_eq!(cat.ngettext("apple", "apples", 1), "one");
+		assert_eq!(cat.ngettext("apple", "apples", 2), "few");
+		assert_eq!(cat.ngettext("apple", "apples", 5), "many");
+		assert_eq!(cat.ngettext("apple", "apples", 11), "many");
+	}
+
+	#[test]
+	fn missing_header_falls_back_to_english_style_rule() {
+		let mo = make_mo(&[("apple\0apples", "one\0many")]);
+		let cat = Catalog::parse(Cursor::new(mo)).unwrap();
+		assert_eq!(cat.ngettext("apple", "apples", 1), "one");
+		assert_eq!(cat.ngettext("apple", "apples", 5), "many");
 	}
 }
