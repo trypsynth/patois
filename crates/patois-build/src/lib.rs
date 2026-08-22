@@ -53,7 +53,12 @@ pub fn compile_translations(po_dir: impl AsRef<Path>, locale_dir: impl AsRef<Pat
 }
 
 fn run_msgfmt(input: &Path, output: &Path) {
-	match Command::new("msgfmt").arg(input).arg("-o").arg(output).status() {
+	// `--use-fuzzy`: `PoDocument::apply_all` leaves every machine-translated entry flagged
+	// `#, fuzzy` permanently (see its doc comment and `needs_translation`), as the marker
+	// that it's translated-but-unreviewed rather than untranslated. msgfmt's default of
+	// dropping fuzzy entries from the compiled catalog would make that distinction pointless
+	// here: the entry would sit in the .po translated forever but never reach the app.
+	match Command::new("msgfmt").arg("--use-fuzzy").arg(input).arg("-o").arg(output).status() {
 		Ok(s) if s.success() => {}
 		Ok(s) => println!("cargo:warning=patois-build: msgfmt exited with {s} compiling {}", input.display()),
 		Err(e) => println!("cargo:warning=patois-build: msgfmt not available ({}); install gettext tools", e),
