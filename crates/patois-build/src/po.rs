@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use crate::{po_unescape, pot_escape};
+use crate::entries::{po_unescape, pot_escape};
 
 /// A single `msgid`/`msgstr` entry, plus the exact line ranges in the source file needed
 /// to patch it in place without disturbing anything else (header metadata, TRANSLATORS
