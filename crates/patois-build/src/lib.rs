@@ -2,10 +2,11 @@ use std::{
 	collections::HashSet,
 	env, error, fs,
 	path::{Path, PathBuf},
-	process::Command,
+	process::{self, Command},
 };
 
 pub mod po;
+mod sanitize_rust;
 
 /// Compile all `.po` files in `po_dir` into `.mo` files under `locale_dir`.
 ///
@@ -95,33 +96,7 @@ pub fn gen_pot_from_dirs(
 	if files.is_empty() {
 		return Ok(());
 	}
-	fs::create_dir_all(po_dir)?;
-	let output_file = po_dir.join(format!("{package_name}.pot"));
-	let temp_file = po_dir.join(format!("{package_name}.pot.new"));
-	let mut cmd = Command::new("xgettext");
-	cmd.arg("--keyword=t")
-		.arg("--keyword=nt:1,2")
-		.arg("--language=C")
-		.arg("--from-code=UTF-8")
-		.arg("--add-comments=TRANSLATORS")
-		.arg("--no-location")
-		.arg("--no-wrap")
-		.arg(format!("--package-name={package_name}"))
-		.arg(format!("--package-version={package_version}"))
-		.arg(format!("--output={}", temp_file.display()));
-	for file in &files {
-		cmd.arg(file);
-	}
-	if !cmd.status()?.success() {
-		return Err("xgettext failed".into());
-	}
-	strip_format_flags(&temp_file)?;
-	preserve_foreign_entries(&output_file, &temp_file)?;
-	if pot_changed(&output_file, &temp_file) {
-		fs::rename(&temp_file, &output_file)?;
-	} else {
-		fs::remove_file(&temp_file)?;
-	}
+	write_pot(&files, po_dir, package_name, package_version)?;
 	Ok(())
 }
 
@@ -182,7 +157,72 @@ pub fn gen_pot(
 		.unwrap_or("0.0.0")
 		.to_string();
 	let output_file = po_dir.join(format!("{package_name}.pot"));
+	if write_pot(&files, po_dir, package_name, &version)? {
+		println!("Updated {}", output_file.display());
+	} else {
+		println!("No changes ({})", output_file.display());
+	}
+	Ok(())
+}
+
+/// Run `xgettext` over `files` and merge the result into `<po_dir>/<package_name>.pot`,
+/// returning whether the pot on disk actually changed.
+///
+/// The sources are sanitized on the way in (see [`sanitize_rust`]): xgettext has no Rust
+/// mode, and the C tokenizer it is asked to use instead runs on past lifetimes and raw
+/// strings, swallowing or splicing unrelated strings further down the file, and in later
+/// files too since they all go to one invocation. Doing it here rather than exposing a
+/// helper keeps `--language=C` an implementation detail of this crate, so no caller has to
+/// know about it or remember to work around it.
+fn write_pot(
+	files: &[PathBuf],
+	po_dir: &Path,
+	package_name: &str,
+	package_version: &str,
+) -> Result<bool, Box<dyn error::Error>> {
+	fs::create_dir_all(po_dir)?;
+	let output_file = po_dir.join(format!("{package_name}.pot"));
 	let temp_file = po_dir.join(format!("{package_name}.pot.new"));
+	let scratch = env::temp_dir().join(format!("patois-build-pot-{}", process::id()));
+	let sanitized = sanitize_files_into(&scratch, files);
+	let result = sanitized.and_then(|sources| run_xgettext(&sources, &temp_file, package_name, package_version));
+	let _ = fs::remove_dir_all(&scratch);
+	result?;
+	strip_format_flags(&temp_file)?;
+	preserve_foreign_entries(&output_file, &temp_file)?;
+	if pot_changed(&output_file, &temp_file) {
+		fs::rename(&temp_file, &output_file)?;
+		Ok(true)
+	} else {
+		fs::remove_file(&temp_file)?;
+		Ok(false)
+	}
+}
+
+/// Write a sanitized copy of every file in `files` into `scratch`, returning the copies in
+/// the same order.
+///
+/// The copies live flat in one directory, named by their position in `files`: two crates can
+/// each have a `main.rs`, and the names never reach the pot (`--no-location`), so they only
+/// have to be unique and recognisable in an xgettext error message.
+fn sanitize_files_into(scratch: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn error::Error>> {
+	fs::create_dir_all(scratch)?;
+	let mut sources = Vec::with_capacity(files.len());
+	for (index, file) in files.iter().enumerate() {
+		let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "src.rs".to_string());
+		let dest = scratch.join(format!("{index:05}-{name}"));
+		fs::write(&dest, sanitize_rust::sanitize_for_xgettext(&fs::read_to_string(file)?))?;
+		sources.push(dest);
+	}
+	Ok(sources)
+}
+
+fn run_xgettext(
+	sources: &[PathBuf],
+	output: &Path,
+	package_name: &str,
+	package_version: &str,
+) -> Result<(), Box<dyn error::Error>> {
 	let mut cmd = Command::new("xgettext");
 	cmd.arg("--keyword=t")
 		.arg("--keyword=nt:1,2")
@@ -192,22 +232,13 @@ pub fn gen_pot(
 		.arg("--no-location")
 		.arg("--no-wrap")
 		.arg(format!("--package-name={package_name}"))
-		.arg(format!("--package-version={version}"))
-		.arg(format!("--output={}", temp_file.display()));
-	for file in &files {
-		cmd.arg(file);
+		.arg(format!("--package-version={package_version}"))
+		.arg(format!("--output={}", output.display()));
+	for source in sources {
+		cmd.arg(source);
 	}
 	if !cmd.status()?.success() {
 		return Err("xgettext failed".into());
-	}
-	strip_format_flags(&temp_file)?;
-	preserve_foreign_entries(&output_file, &temp_file)?;
-	if pot_changed(&output_file, &temp_file) {
-		fs::rename(&temp_file, &output_file)?;
-		println!("Updated {}", output_file.display());
-	} else {
-		fs::remove_file(&temp_file)?;
-		println!("No changes ({})", output_file.display());
 	}
 	Ok(())
 }
