@@ -59,13 +59,13 @@ impl Registry {
 			return catalog.gettext(msgid).to_string();
 		}
 		// Fall back to the default domain when the specific domain has no catalog.
-		if let Some(default) = self.default_domain.clone() {
-			if default != domain {
-				self.ensure_catalog(&default);
-				let fallback_key = (self.locale.clone(), default);
-				if let Some(Some(catalog)) = self.cache.get(&fallback_key) {
-					return catalog.gettext(msgid).to_string();
-				}
+		if let Some(default) = self.default_domain.clone()
+			&& default != domain
+		{
+			self.ensure_catalog(&default);
+			let fallback_key = (self.locale.clone(), default);
+			if let Some(Some(catalog)) = self.cache.get(&fallback_key) {
+				return catalog.gettext(msgid).to_string();
 			}
 		}
 		msgid.to_string()
@@ -77,13 +77,13 @@ impl Registry {
 		if let Some(Some(catalog)) = self.cache.get(&key) {
 			return catalog.ngettext(singular, plural, n).to_string();
 		}
-		if let Some(default) = self.default_domain.clone() {
-			if default != domain {
-				self.ensure_catalog(&default);
-				let fallback_key = (self.locale.clone(), default);
-				if let Some(Some(catalog)) = self.cache.get(&fallback_key) {
-					return catalog.ngettext(singular, plural, n).to_string();
-				}
+		if let Some(default) = self.default_domain.clone()
+			&& default != domain
+		{
+			self.ensure_catalog(&default);
+			let fallback_key = (self.locale.clone(), default);
+			if let Some(Some(catalog)) = self.cache.get(&fallback_key) {
+				return catalog.ngettext(singular, plural, n).to_string();
 			}
 		}
 		if n == 1 { singular.to_string() } else { plural.to_string() }
@@ -104,10 +104,10 @@ impl Registry {
 			for ed in inventory::iter::<EmbeddedDomain> {
 				if ed.name == domain {
 					for (file_locale, bytes) in ed.files {
-						if *file_locale == loc {
-							if let Ok(catalog) = Catalog::parse(Cursor::new(*bytes)) {
-								return Some(catalog);
-							}
+						if *file_locale == loc
+							&& let Ok(catalog) = Catalog::parse(Cursor::new(*bytes))
+						{
+							return Some(catalog);
 						}
 					}
 				}
@@ -115,10 +115,10 @@ impl Registry {
 			// Path-based domains (the app's own strings via init()).
 			if let Some(base) = self.paths.get(domain) {
 				let path = base.join(&loc).join("LC_MESSAGES").join(format!("{domain}.mo"));
-				if let Ok(file) = File::open(&path) {
-					if let Ok(catalog) = Catalog::parse(file) {
-						return Some(catalog);
-					}
+				if let Ok(file) = File::open(&path)
+					&& let Ok(catalog) = Catalog::parse(file)
+				{
+					return Some(catalog);
 				}
 			}
 		}
