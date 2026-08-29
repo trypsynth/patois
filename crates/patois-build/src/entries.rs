@@ -4,22 +4,35 @@
 
 use std::collections::HashSet;
 
-/// A parsed pot/po entry: a msgid, and its msgid_plural text if it's a plural entry.
+/// A parsed pot/po entry: a msgid, its msgid_plural text if it's a plural entry, and the
+/// `#:` reference naming what produced it, for entries that carry one.
 pub(crate) struct PotEntry {
 	pub(crate) msgid: String,
 	pub(crate) msgid_plural: Option<String>,
+	/// The entry's `#:` line, naming the scan the string came from (e.g. `swift`).
+	///
+	/// `xgettext` runs with `--no-location`, so nothing extracted from Rust ever carries one.
+	/// That is what makes a reference usable as the marker for "this came from a non-Rust
+	/// scan", and what lets a regeneration carry those entries across without also
+	/// resurrecting Rust msgids that were renamed or deleted in the same edit.
+	pub(crate) reference: Option<String>,
 }
 
 /// Renders a `PotEntry` as the block of lines to append to a pot file (blank msgstr(s), ready
 /// for `msgmerge` or a translator to fill in).
+///
+/// The `#:` line is re-emitted when the entry has one. Dropping it would un-mark a foreign
+/// entry the moment it was preserved, so the next regeneration would discard it, the scan that
+/// owns it would add it back, and the pot would be rewritten on every other run.
 pub(crate) fn pot_entry_block(entry: &PotEntry) -> String {
+	let reference = entry.reference.as_ref().map_or_else(String::new, |r| format!("#: {r}\n"));
 	match &entry.msgid_plural {
 		Some(plural) => format!(
-			"\nmsgid \"{}\"\nmsgid_plural \"{}\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
+			"\n{reference}msgid \"{}\"\nmsgid_plural \"{}\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
 			pot_escape(&entry.msgid),
 			pot_escape(plural)
 		),
-		None => format!("\nmsgid \"{}\"\nmsgstr \"\"\n", pot_escape(&entry.msgid)),
+		None => format!("\n{reference}msgid \"{}\"\nmsgstr \"\"\n", pot_escape(&entry.msgid)),
 	}
 }
 
@@ -34,27 +47,45 @@ pub(crate) fn collect_pot_entries_ordered(content: &str) -> Vec<PotEntry> {
 	let mut entries: Vec<PotEntry> = Vec::new();
 	let mut current_id = String::new();
 	let mut current_plural: Option<String> = None;
+	let mut current_reference: Option<String> = None;
+	// A `#:` line comes *before* the msgid it belongs to, so it is held here until that msgid
+	// line arrives and takes it.
+	let mut pending_reference: Option<String> = None;
 	let mut in_msgid = false;
 	let mut in_msgid_plural = false;
-	let flush = |current_id: &mut String, current_plural: &mut Option<String>, entries: &mut Vec<PotEntry>| {
+	let flush = |current_id: &mut String,
+	             current_plural: &mut Option<String>,
+	             current_reference: &mut Option<String>,
+	             entries: &mut Vec<PotEntry>| {
 		if !current_id.is_empty() || current_plural.is_some() {
-			entries.push(PotEntry { msgid: std::mem::take(current_id), msgid_plural: current_plural.take() });
+			entries.push(PotEntry {
+				msgid: std::mem::take(current_id),
+				msgid_plural: current_plural.take(),
+				reference: current_reference.take(),
+			});
+		} else {
+			// The header entry (empty msgid) isn't emitted, so anything picked up ahead of it
+			// would otherwise leak onto the first real entry.
+			*current_reference = None;
 		}
 	};
 	for line in content.lines() {
 		let line = line.trim();
-		if let Some(rest) = line.strip_prefix("msgid_plural ") {
+		if let Some(rest) = line.strip_prefix("#:") {
+			pending_reference = Some(rest.trim().to_string());
+		} else if let Some(rest) = line.strip_prefix("msgid_plural ") {
 			current_plural = Some(po_unescape(rest));
 			in_msgid = false;
 			in_msgid_plural = true;
 		} else if let Some(rest) = line.strip_prefix("msgid ") {
-			flush(&mut current_id, &mut current_plural, &mut entries);
+			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
 			current_id = po_unescape(rest);
+			current_reference = pending_reference.take();
 			in_msgid = true;
 			in_msgid_plural = false;
 		} else if line.starts_with("msgstr") {
 			// Covers both a plain entry's `msgstr "..."` and a plural entry's `msgstr[N] "..."`.
-			flush(&mut current_id, &mut current_plural, &mut entries);
+			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
 			in_msgid = false;
 			in_msgid_plural = false;
 		} else if line.starts_with('"') {
@@ -67,7 +98,7 @@ pub(crate) fn collect_pot_entries_ordered(content: &str) -> Vec<PotEntry> {
 			}
 		}
 	}
-	flush(&mut current_id, &mut current_plural, &mut entries);
+	flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
 	entries
 }
 
@@ -142,5 +173,36 @@ mod tests {
 		assert_eq!(plural_entry.msgid_plural.as_deref(), Some("{} results"));
 		let singular_entry = entries.iter().find(|e| e.msgid == "Cancel").unwrap();
 		assert_eq!(singular_entry.msgid_plural, None);
+	}
+
+	// The `#:` line sits above its msgid, so it has to be held and attached to the entry that
+	// follows rather than the one just finished.
+	#[test]
+	fn collect_pot_entries_attaches_a_reference_to_the_entry_below_it() {
+		let pot = "msgid \"\"\nmsgstr \"\"\n\nmsgid \"From Rust\"\nmsgstr \"\"\n\n#: swift\nmsgid \"From Swift\"\nmsgstr \"\"\n";
+		let entries = collect_pot_entries_ordered(pot);
+		let rust = entries.iter().find(|e| e.msgid == "From Rust").unwrap();
+		assert_eq!(rust.reference, None, "the reference belongs to the entry after it, not before");
+		let swift = entries.iter().find(|e| e.msgid == "From Swift").unwrap();
+		assert_eq!(swift.reference.as_deref(), Some("swift"));
+	}
+
+	// The header's empty msgid is parsed but never emitted as an entry, so a reference read
+	// before it has nowhere to go and must not drift onto the first real string.
+	#[test]
+	fn a_reference_above_the_header_does_not_leak_onto_the_first_entry() {
+		let pot = "#: swift\nmsgid \"\"\nmsgstr \"\"\n\nmsgid \"Cancel\"\nmsgstr \"\"\n";
+		let entries = collect_pot_entries_ordered(pot);
+		let cancel = entries.iter().find(|e| e.msgid == "Cancel").unwrap();
+		assert_eq!(cancel.reference, None);
+	}
+
+	#[test]
+	fn pot_entry_block_round_trips_a_reference() {
+		let entry = PotEntry { msgid: "Continue".to_string(), msgid_plural: None, reference: Some("kt".to_string()) };
+		let rendered = pot_entry_block(&entry);
+		assert!(rendered.contains("#: kt\nmsgid \"Continue\""));
+		let parsed = collect_pot_entries_ordered(&rendered);
+		assert_eq!(parsed[0].reference.as_deref(), Some("kt"));
 	}
 }

@@ -246,7 +246,7 @@ fn pot_changed(old: &Path, new: &Path) -> bool {
 	strip_date(&old) != strip_date(&new)
 }
 
-/// Copy entries present in `old` but absent from `new` into `new`, appending them at the end.
+/// Copy the entries `old` got from a non-Rust scan into `new`, appending them at the end.
 ///
 /// `gen_pot`/`gen_pot_from_dirs` regenerate the `.pot` from a single language's sources (Rust),
 /// but callers often layer other languages on top afterward via
@@ -254,6 +254,14 @@ fn pot_changed(old: &Path, new: &Path) -> bool {
 /// regenerated file would always be missing those entries relative to the accumulated file on
 /// disk, so `pot_changed` would see a spurious difference and bump `POT-Creation-Date` on every
 /// single build even when no msgid actually changed.
+///
+/// Which entries those are is read off the `#:` reference [`extend_pot_from_source_dirs`]
+/// stamps on everything it adds, not inferred from "the Rust scan didn't produce it". The
+/// inference is what this function used to do, and it is wrong in a way that only shows up
+/// later: a msgid that Rust no longer produces because it was just renamed or deleted looks
+/// exactly like a Swift one, so it was copied forward, and then copied forward again on every
+/// subsequent run, since by then it was in `old` too. The dead msgid outlived the source line
+/// it came from indefinitely, and a `grep` for it in the tree turned up nothing to explain it.
 fn preserve_foreign_entries(old: &Path, new: &Path) -> Result<(), Box<dyn error::Error>> {
 	let Ok(old_content) = fs::read_to_string(old) else {
 		return Ok(());
@@ -263,7 +271,7 @@ fn preserve_foreign_entries(old: &Path, new: &Path) -> Result<(), Box<dyn error:
 	let mut additions = String::new();
 	let mut seen: HashSet<String> = HashSet::new();
 	for entry in collect_pot_entries_ordered(&old_content) {
-		if !new_ids.contains(&entry.msgid) && seen.insert(entry.msgid.clone()) {
+		if entry.reference.is_some() && !new_ids.contains(&entry.msgid) && seen.insert(entry.msgid.clone()) {
 			additions.push_str(&pot_entry_block(&entry));
 		}
 	}
@@ -309,26 +317,77 @@ msgstr \"\"
 		assert!(result.contains("msgid \"No flags here\""));
 	}
 
+	/// A pot with a header entry followed by `body`.
+	fn pot(body: &str) -> String {
+		format!("msgid \"\"\nmsgstr \"\"\n{body}")
+	}
+
+	fn scratch(name: &str) -> PathBuf {
+		let dir = env::temp_dir().join(format!("patois-build-{name}-{}", std::process::id()));
+		fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
 	#[test]
 	fn preserve_foreign_entries_keeps_plural_entries_intact() {
-		let dir = env::temp_dir().join(format!("patois-build-preserve-plural-test-{}", std::process::id()));
-		fs::create_dir_all(&dir).unwrap();
+		let dir = scratch("preserve-plural-test");
 		let old = dir.join("old.pot");
 		let new = dir.join("new.pot");
-		// The old pot has a plural entry that the fresh xgettext scan (simulated by `new`)
-		// no longer produced, e.g. because gap 1 (missing --keyword=nt:1,2) meant it was
-		// hand-added and would otherwise get flattened on the next regeneration.
+		// A plural entry from a Swift scan, which the Rust-only regeneration (simulated by
+		// `new`) naturally doesn't produce. Preserving it has to keep both halves of the
+		// plural and both msgstr slots, not flatten it to a singular entry.
 		fs::write(
 			&old,
-			"msgid \"\"\nmsgstr \"\"\n\nmsgid \"{} result\"\nmsgid_plural \"{} results\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
+			pot("\n#: swift\nmsgid \"{} result\"\nmsgid_plural \"{} results\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n"),
 		)
 		.unwrap();
-		fs::write(&new, "msgid \"\"\nmsgstr \"\"\n").unwrap();
+		fs::write(&new, pot("")).unwrap();
 		preserve_foreign_entries(&old, &new).unwrap();
 		let result = fs::read_to_string(&new).unwrap();
 		fs::remove_dir_all(&dir).unwrap();
 		assert!(result.contains("msgid \"{} result\"\nmsgid_plural \"{} results\""));
 		assert!(result.contains("msgstr[0] \"\""));
 		assert!(result.contains("msgstr[1] \"\""));
+	}
+
+	// The bug this whole `#:` marker exists for. Renaming a `t("...")` string means the fresh
+	// Rust scan stops producing the old msgid, which is indistinguishable from a Swift/Kotlin
+	// entry if you only ask "did the Rust scan produce it". Carrying it forward stranded the
+	// dead msgid in the pot, and because it was then in `old` on the next run too, no later
+	// regeneration would ever drop it.
+	#[test]
+	fn a_renamed_rust_msgid_is_not_carried_forward() {
+		let dir = scratch("preserve-rename-test");
+		let old = dir.join("old.pot");
+		let new = dir.join("new.pot");
+		fs::write(&old, pot("\nmsgid \"Paperback - {}\"\nmsgstr \"\"\n")).unwrap();
+		fs::write(&new, pot("\nmsgid \"{} - Paperback\"\nmsgstr \"\"\n")).unwrap();
+		preserve_foreign_entries(&old, &new).unwrap();
+		let result = fs::read_to_string(&new).unwrap();
+		fs::remove_dir_all(&dir).unwrap();
+		assert!(result.contains("msgid \"{} - Paperback\""), "the new name should still be there");
+		assert!(!result.contains("msgid \"Paperback - {}\""), "the renamed-away msgid should not be carried forward");
+	}
+
+	// A foreign entry has to come back out of `preserve_foreign_entries` still marked, or the
+	// next run wouldn't recognise it, would drop it, and the Swift scan would append it again:
+	// a rewritten pot (and a fresh POT-Creation-Date) on every other run, forever.
+	#[test]
+	fn a_preserved_foreign_entry_keeps_its_marker() {
+		let dir = scratch("preserve-marker-test");
+		let old = dir.join("old.pot");
+		let new = dir.join("new.pot");
+		fs::write(&old, pot("\n#: swift\nmsgid \"Continue\"\nmsgstr \"\"\n")).unwrap();
+		fs::write(&new, pot("")).unwrap();
+		preserve_foreign_entries(&old, &new).unwrap();
+		let once = fs::read_to_string(&new).unwrap();
+		assert!(once.contains("#: swift\nmsgid \"Continue\""), "marker lost on the way through");
+		// Feed the result back in as the old pot: a second round has to be a no-op.
+		fs::write(&old, &once).unwrap();
+		fs::write(&new, pot("")).unwrap();
+		preserve_foreign_entries(&old, &new).unwrap();
+		let twice = fs::read_to_string(&new).unwrap();
+		fs::remove_dir_all(&dir).unwrap();
+		assert_eq!(once, twice, "preserving is not idempotent, so the pot would churn every run");
 	}
 }

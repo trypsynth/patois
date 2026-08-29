@@ -52,18 +52,27 @@ pub fn extend_pot_from_source_dirs(
 	// Collect t("...")/nt("...", "...") calls from every source file, preserving first-seen
 	// order. Both share one "seen" set keyed on the singular text so the same string can't be
 	// added twice even if it turns up as both a t() and an nt() call somewhere.
+	//
+	// Every entry is stamped with `extension` as its `#:` reference. That is what marks it as
+	// belonging to this scan rather than to the Rust one that wrote the pot, so a later
+	// regeneration can carry it across (see `pot::preserve_foreign_entries`) without having to
+	// guess, and without that guess also resurrecting deleted Rust msgids.
 	let mut new_entries: Vec<PotEntry> = Vec::new();
 	let mut seen_in_scan: HashSet<String> = HashSet::new();
 	for file in &files {
 		let content = fs::read_to_string(file)?;
 		for s in extract_t_strings(&content) {
 			if seen_in_scan.insert(s.clone()) {
-				new_entries.push(PotEntry { msgid: s, msgid_plural: None });
+				new_entries.push(PotEntry { msgid: s, msgid_plural: None, reference: Some(extension.to_string()) });
 			}
 		}
 		for (singular, plural) in extract_nt_strings(&content) {
 			if seen_in_scan.insert(singular.clone()) {
-				new_entries.push(PotEntry { msgid: singular, msgid_plural: Some(plural) });
+				new_entries.push(PotEntry {
+					msgid: singular,
+					msgid_plural: Some(plural),
+					reference: Some(extension.to_string()),
+				});
 			}
 		}
 	}
