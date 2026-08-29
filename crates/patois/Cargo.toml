@@ -9,7 +9,10 @@ categories = ["localization", "internationalization"]
 
 [dependencies]
 inventory = "0.3.24"
-patois-macros = { version = "0.2.0", path = "../patois-macros" }
+# Pinned exactly, not `^`: `embed_domain!` expands to code naming this crate's own
+# `EmbeddedDomain` type, so a mismatched pair would fail to compile for a downstream user
+# with no version requirement to stop cargo resolving it that way.
+patois-macros = { version = "=0.2.0", path = "../patois-macros" }
 sys-locale = "0.3.2"
 wxdragon = { version = "0.9.18", optional = true }
 
