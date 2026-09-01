@@ -4,8 +4,9 @@
 
 use std::collections::HashSet;
 
-/// A parsed pot/po entry: a msgid, its msgid_plural text if it's a plural entry, and the
-/// `#:` reference naming what produced it, for entries that carry one.
+/// A parsed pot/po entry: a msgid, its msgid_plural text if it's a plural entry, the `#:`
+/// reference naming what produced it, and the `#.` note left for translators, for entries
+/// that carry them.
 pub(crate) struct PotEntry {
 	pub(crate) msgid: String,
 	pub(crate) msgid_plural: Option<String>,
@@ -16,6 +17,12 @@ pub(crate) struct PotEntry {
 	/// scan", and what lets a regeneration carry those entries across without also
 	/// resurrecting Rust msgids that were renamed or deleted in the same edit.
 	pub(crate) reference: Option<String>,
+	/// The entry's `#.` extracted-comment text: the note the source left for translators.
+	///
+	/// Stored without the `#. ` prefix, and newline-separated when the note ran to several
+	/// lines. `xgettext --add-comments=TRANSLATORS` produces these for Rust; the hand-written
+	/// scanner in [`crate::extract`] produces them for the other languages.
+	pub(crate) comment: Option<String>,
 }
 
 /// Renders a `PotEntry` as the block of lines to append to a pot file (blank msgstr(s), ready
@@ -25,14 +32,19 @@ pub(crate) struct PotEntry {
 /// entry the moment it was preserved, so the next regeneration would discard it, the scan that
 /// owns it would add it back, and the pot would be rewritten on every other run.
 pub(crate) fn pot_entry_block(entry: &PotEntry) -> String {
+	// `#.` sits above `#:`, the order xgettext itself writes the two in.
+	let comment = entry
+		.comment
+		.as_ref()
+		.map_or_else(String::new, |c| c.lines().map(|line| format!("#. {line}\n")).collect::<String>());
 	let reference = entry.reference.as_ref().map_or_else(String::new, |r| format!("#: {r}\n"));
 	match &entry.msgid_plural {
 		Some(plural) => format!(
-			"\n{reference}msgid \"{}\"\nmsgid_plural \"{}\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
+			"\n{comment}{reference}msgid \"{}\"\nmsgid_plural \"{}\"\nmsgstr[0] \"\"\nmsgstr[1] \"\"\n",
 			pot_escape(&entry.msgid),
 			pot_escape(plural)
 		),
-		None => format!("\n{reference}msgid \"{}\"\nmsgstr \"\"\n", pot_escape(&entry.msgid)),
+		None => format!("\n{comment}{reference}msgid \"{}\"\nmsgstr \"\"\n", pot_escape(&entry.msgid)),
 	}
 }
 
@@ -48,44 +60,57 @@ pub(crate) fn collect_pot_entries_ordered(content: &str) -> Vec<PotEntry> {
 	let mut current_id = String::new();
 	let mut current_plural: Option<String> = None;
 	let mut current_reference: Option<String> = None;
+	let mut current_comment: Option<String> = None;
 	// A `#:` line comes *before* the msgid it belongs to, so it is held here until that msgid
 	// line arrives and takes it.
 	let mut pending_reference: Option<String> = None;
+	let mut pending_comment: Option<String> = None;
 	let mut in_msgid = false;
 	let mut in_msgid_plural = false;
 	let flush = |current_id: &mut String,
 	             current_plural: &mut Option<String>,
 	             current_reference: &mut Option<String>,
+	             current_comment: &mut Option<String>,
 	             entries: &mut Vec<PotEntry>| {
 		if !current_id.is_empty() || current_plural.is_some() {
 			entries.push(PotEntry {
 				msgid: std::mem::take(current_id),
 				msgid_plural: current_plural.take(),
 				reference: current_reference.take(),
+				comment: current_comment.take(),
 			});
 		} else {
 			// The header entry (empty msgid) isn't emitted, so anything picked up ahead of it
 			// would otherwise leak onto the first real entry.
 			*current_reference = None;
+			*current_comment = None;
 		}
 	};
 	for line in content.lines() {
 		let line = line.trim();
-		if let Some(rest) = line.strip_prefix("#:") {
+		if let Some(rest) = line.strip_prefix("#.") {
+			// A note can run to several `#.` lines; keep them as one newline-joined string.
+			let text = rest.trim();
+			pending_comment = Some(match pending_comment.take() {
+				Some(existing) => format!("{existing}\n{text}"),
+				None => text.to_string(),
+			});
+		} else if let Some(rest) = line.strip_prefix("#:") {
 			pending_reference = Some(rest.trim().to_string());
 		} else if let Some(rest) = line.strip_prefix("msgid_plural ") {
 			current_plural = Some(po_unescape(rest));
 			in_msgid = false;
 			in_msgid_plural = true;
 		} else if let Some(rest) = line.strip_prefix("msgid ") {
-			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
+			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut current_comment, &mut entries);
 			current_id = po_unescape(rest);
 			current_reference = pending_reference.take();
+			current_comment = pending_comment.take();
 			in_msgid = true;
 			in_msgid_plural = false;
 		} else if line.starts_with("msgstr") {
 			// Covers both a plain entry's `msgstr "..."` and a plural entry's `msgstr[N] "..."`.
-			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
+			flush(&mut current_id, &mut current_plural, &mut current_reference, &mut current_comment, &mut entries);
 			in_msgid = false;
 			in_msgid_plural = false;
 		} else if line.starts_with('"') {
@@ -98,7 +123,7 @@ pub(crate) fn collect_pot_entries_ordered(content: &str) -> Vec<PotEntry> {
 			}
 		}
 	}
-	flush(&mut current_id, &mut current_plural, &mut current_reference, &mut entries);
+	flush(&mut current_id, &mut current_plural, &mut current_reference, &mut current_comment, &mut entries);
 	entries
 }
 
@@ -199,10 +224,53 @@ mod tests {
 
 	#[test]
 	fn pot_entry_block_round_trips_a_reference() {
-		let entry = PotEntry { msgid: "Continue".to_string(), msgid_plural: None, reference: Some("kt".to_string()) };
+		let entry = PotEntry {
+			msgid: "Continue".to_string(),
+			msgid_plural: None,
+			reference: Some("kt".to_string()),
+			comment: None,
+		};
 		let rendered = pot_entry_block(&entry);
 		assert!(rendered.contains("#: kt\nmsgid \"Continue\""));
 		let parsed = collect_pot_entries_ordered(&rendered);
 		assert_eq!(parsed[0].reference.as_deref(), Some("kt"));
+	}
+	// A note has to survive a preserve-and-rewrite cycle: `preserve_foreign_entries` parses the
+	// old pot and re-renders what it finds, so anything the parser drops is gone for good.
+	#[test]
+	fn pot_entry_block_round_trips_a_comment() {
+		let entry = PotEntry {
+			msgid: "Continue".to_string(),
+			msgid_plural: None,
+			reference: Some("kt".to_string()),
+			comment: Some("TRANSLATORS: on the last onboarding page".to_string()),
+		};
+		let rendered = pot_entry_block(&entry);
+		assert!(rendered.contains("#. TRANSLATORS: on the last onboarding page\n#: kt\nmsgid"));
+		let parsed = collect_pot_entries_ordered(&rendered);
+		assert_eq!(parsed[0].comment.as_deref(), Some("TRANSLATORS: on the last onboarding page"));
+	}
+
+	#[test]
+	fn a_comment_spanning_several_lines_round_trips() {
+		let entry = PotEntry {
+			msgid: "Continue".to_string(),
+			msgid_plural: None,
+			reference: None,
+			comment: Some("TRANSLATORS: first half\nsecond half".to_string()),
+		};
+		let rendered = pot_entry_block(&entry);
+		assert!(rendered.contains("#. TRANSLATORS: first half\n#. second half\n"));
+		let parsed = collect_pot_entries_ordered(&rendered);
+		assert_eq!(parsed[0].comment.as_deref(), Some("TRANSLATORS: first half\nsecond half"));
+	}
+
+	// Same trap as the reference: a `#.` read before the header entry has nowhere to go.
+	#[test]
+	fn a_comment_above_the_header_does_not_leak_onto_the_first_entry() {
+		let pot = "#. TRANSLATORS: stray\nmsgid \"\"\nmsgstr \"\"\n\nmsgid \"Cancel\"\nmsgstr \"\"\n";
+		let entries = collect_pot_entries_ordered(pot);
+		let cancel = entries.iter().find(|e| e.msgid == "Cancel").unwrap();
+		assert_eq!(cancel.comment, None);
 	}
 }
