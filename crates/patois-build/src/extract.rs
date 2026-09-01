@@ -108,6 +108,79 @@ pub fn extend_pot_from_source_dirs(
 	Ok(())
 }
 
+/// Remove the entries a previous [`extend_pot_from_source_dirs`] added whose string no longer
+/// appears in the sources, and report what went.
+///
+/// Adding is not enough on its own: a `#: <extension>` entry stays in the pot for good once it
+/// lands there, because a regeneration copies it across rather than rebuilding it from source
+/// (see `pot::preserve_foreign_entries`). Renaming or deleting a `t("...")` call therefore
+/// leaves the old text behind, and translators keep being asked for a string nothing reads.
+///
+/// Entries carrying a different `#:` reference, and the xgettext-owned ones carrying none, are
+/// left alone.
+///
+/// # Errors
+///
+/// Returns an error if a source directory or the pot cannot be read, or the pot cannot be
+/// written.
+pub fn prune_pot_from_source_dirs(
+	dirs: &[impl AsRef<Path>],
+	extension: &str,
+	pot_file: impl AsRef<Path>,
+) -> Result<Vec<String>, Box<dyn error::Error>> {
+	let pot_file = pot_file.as_ref();
+	if !pot_file.exists() {
+		return Ok(Vec::new());
+	}
+	let mut files: Vec<PathBuf> = Vec::new();
+	for dir in dirs {
+		collect_source_files(dir.as_ref(), extension, &mut files)?;
+	}
+	// Nothing to compare against is not the same as nothing being alive: a directory that moved
+	// would otherwise read as every string having been deleted at once.
+	if files.is_empty() {
+		return Ok(Vec::new());
+	}
+	// Asking the extractor what the sources say, rather than searching them for the text, means
+	// an entry survives exactly when the call that produced it is still there. Searching would
+	// also keep one whose words happen to appear in a comment, or in a string that is not a
+	// translation call at all.
+	let mut alive: HashSet<String> = HashSet::new();
+	for file in &files {
+		let content = fs::read_to_string(file)?;
+		for (s, _) in extract_t_strings(&content) {
+			alive.insert(s);
+		}
+		for (singular, _, _) in extract_nt_strings(&content) {
+			alive.insert(singular);
+		}
+	}
+	let existing = fs::read_to_string(pot_file)?;
+	let reference = format!("#: {extension}");
+	let mut removed: Vec<String> = Vec::new();
+	let kept: Vec<&str> = existing
+		.split("\n\n")
+		.filter(|block| {
+			let lines: Vec<&str> = block.lines().collect();
+			if !lines.iter().any(|l| l.trim() == reference) {
+				return true;
+			}
+			let Some(msgid) = block_msgid(&lines) else {
+				return true;
+			};
+			if alive.contains(&msgid) {
+				return true;
+			}
+			removed.push(msgid);
+			false
+		})
+		.collect();
+	if !removed.is_empty() {
+		fs::write(pot_file, kept.join("\n\n"))?;
+	}
+	Ok(removed)
+}
+
 /// Bring the `#.` notes on the entries this scan owns into line with what the sources now say.
 ///
 /// [`extend_pot_from_source_dirs`] only ever *appends* msgids the pot does not have yet, and a
@@ -454,6 +527,80 @@ mod tests {
 		let got = extract_nt_strings(src);
 		assert_eq!(got[0].2.as_deref(), Some("TRANSLATORS: {} is the match count"));
 	}
+	/// A temporary directory holding one source file, removed when the test ends.
+	struct SourceDir {
+		dir: std::path::PathBuf,
+	}
+
+	impl SourceDir {
+		fn with(name: &str, contents: &str) -> Self {
+			let dir = std::env::temp_dir().join(format!("patois-prune-{}-{}", std::process::id(), name));
+			fs::create_dir_all(&dir).unwrap();
+			fs::write(dir.join("Screen.kt"), contents).unwrap();
+			Self { dir }
+		}
+
+		fn pot(&self, contents: &str) -> std::path::PathBuf {
+			let path = self.dir.join("messages.pot");
+			fs::write(&path, contents).unwrap();
+			path
+		}
+	}
+
+	impl Drop for SourceDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.dir);
+		}
+	}
+
+	#[test]
+	fn an_entry_whose_call_is_gone_is_removed() {
+		let src = SourceDir::with("gone", "Text(t(\"Still called\"))\n// Gone now: mentioned only in a comment\n");
+		let pot = src.pot("msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust owned\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Still called\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Gone now\"\nmsgstr \"\"\n\n#: swift\nmsgid \"Another platform\"\nmsgstr \"\"\n");
+		let removed = prune_pot_from_source_dirs(&[&src.dir], "kt", &pot).unwrap();
+		assert_eq!(removed, vec!["Gone now".to_string()]);
+		let after = fs::read_to_string(&pot).unwrap();
+		assert!(after.contains("Still called"), "the call that is still there keeps its entry");
+		assert!(!after.contains("Gone now"), "the one that is not should have gone");
+	}
+
+	/// Entries belonging to another scan, and the xgettext-owned ones with no reference at
+	/// all, are none of this function's business.
+	#[test]
+	fn entries_owned_by_others_are_left_alone() {
+		let src = SourceDir::with("others", "Text(t(\"Still called\"))\n// Gone now: mentioned only in a comment\n");
+		let pot = src.pot("msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust owned\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Still called\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Gone now\"\nmsgstr \"\"\n\n#: swift\nmsgid \"Another platform\"\nmsgstr \"\"\n");
+		prune_pot_from_source_dirs(&[&src.dir], "kt", &pot).unwrap();
+		let after = fs::read_to_string(&pot).unwrap();
+		assert!(after.contains("Rust owned"), "no reference means xgettext owns it");
+		assert!(after.contains("Another platform"), "a different reference means a different scan owns it");
+	}
+
+	/// The text appears in the file, but only in a comment. Searching the source for it
+	/// would keep the entry; asking the extractor what the file actually declares does not.
+	#[test]
+	fn a_string_that_only_appears_in_a_comment_does_not_keep_an_entry() {
+		let src = SourceDir::with("comment", "Text(t(\"Still called\"))\n// Gone now: mentioned only in a comment\n");
+		let pot = src.pot("msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust owned\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Still called\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Gone now\"\nmsgstr \"\"\n\n#: swift\nmsgid \"Another platform\"\nmsgstr \"\"\n");
+		let removed = prune_pot_from_source_dirs(&[&src.dir], "kt", &pot).unwrap();
+		assert!(removed.contains(&"Gone now".to_string()));
+	}
+
+	/// A directory that moved reads as an empty scan, which must not be taken as every
+	/// string having been deleted at once.
+	#[test]
+	fn no_sources_at_all_removes_nothing() {
+		let src = SourceDir::with("empty", "");
+		let pot = src.pot("msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust owned\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Still called\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Gone now\"\nmsgstr \"\"\n\n#: swift\nmsgid \"Another platform\"\nmsgstr \"\"\n");
+		let missing = src.dir.join("not-here");
+		let removed = prune_pot_from_source_dirs(&[&missing], "kt", &pot).unwrap();
+		assert!(removed.is_empty());
+		assert_eq!(
+			fs::read_to_string(&pot).unwrap(),
+			"msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust owned\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Still called\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Gone now\"\nmsgstr \"\"\n\n#: swift\nmsgid \"Another platform\"\nmsgstr \"\"\n"
+		);
+	}
+
 	/// A pot holding one Rust-owned entry and one `kt` entry, both without notes.
 	fn pot_with_a_kt_entry() -> String {
 		String::from("msgid \"\"\nmsgstr \"\"\n\nmsgid \"Rust\"\nmsgstr \"\"\n\n#: kt\nmsgid \"Cancel\"\nmsgstr \"\"\n")
