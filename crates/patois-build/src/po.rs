@@ -35,6 +35,10 @@ pub struct PoEntryLoc {
 	/// `nplurals` in the file's `Plural-Forms` header (see [`PoDocument::nplurals`]) says how
 	/// many the language has, and Russian's three are as normal as French's two.
 	pub msgstr_plural: Vec<String>,
+	/// The `#.` note above the entry, as gettext writes it for a `TRANSLATORS:` comment in the
+	/// source, with the lines of a run joined by a space and the marker itself dropped. `None`
+	/// where the entry has no note.
+	pub comment: Option<String>,
 	pub is_fuzzy: bool,
 	/// Whether this entry carries a `#|` "previous msgid" comment, `msgmerge` writes one
 	/// exactly when *it* just fuzzy-matched this entry against a changed source string.
@@ -73,11 +77,17 @@ impl PoDocument {
 		let mut entries = Vec::new();
 		let mut flag_line: Option<usize> = None;
 		let mut prev_msgid_range: Option<(usize, usize)> = None;
+		let mut pending_comment: Vec<String> = Vec::new();
 		let mut i = 0;
 		while i < lines.len() {
 			let trimmed = lines[i].trim_start();
 			if trimmed.starts_with('#') {
-				if trimmed.starts_with("#,") {
+				if let Some(note) = trimmed.strip_prefix("#.") {
+					let note = note.trim();
+					// `TRANSLATORS:` marks the note for whoever reads the catalog; what follows
+					// it is the note itself.
+					pending_comment.push(note.strip_prefix("TRANSLATORS:").unwrap_or(note).trim().to_string());
+				} else if trimmed.starts_with("#,") {
 					flag_line = Some(i);
 				} else if trimmed.starts_with("#|") {
 					prev_msgid_range = Some(prev_msgid_range.map_or((i, i + 1), |(start, _)| (start, i + 1)));
@@ -88,6 +98,7 @@ impl PoDocument {
 			if trimmed.is_empty() {
 				flag_line = None;
 				prev_msgid_range = None;
+				pending_comment.clear();
 				i += 1;
 				continue;
 			}
@@ -134,6 +145,7 @@ impl PoDocument {
 					msgstr,
 					msgid_plural,
 					msgstr_plural,
+					comment: (!pending_comment.is_empty()).then(|| pending_comment.join(" ")),
 					is_fuzzy,
 					has_prev_msgid: prev_msgid_range.is_some(),
 					flag_block: flag_block_start..msgid_start,
@@ -142,6 +154,7 @@ impl PoDocument {
 			}
 			flag_line = None;
 			prev_msgid_range = None;
+			pending_comment.clear();
 		}
 		Self { lines, entries }
 	}
@@ -298,6 +311,53 @@ mod tests {
 
 	fn find<'a>(doc: &'a PoDocument, msgid: &str) -> &'a PoEntryLoc {
 		doc.entries.iter().find(|e| e.msgid == msgid).unwrap_or_else(|| panic!("no entry for {msgid:?}"))
+	}
+
+	#[test]
+	fn an_entry_carries_the_note_written_above_it() {
+		let src = "#. TRANSLATORS: shown on hover
+msgid \"Warning\"
+msgstr \"\"
+";
+		let doc = PoDocument::parse(src);
+		assert_eq!(doc.entries[0].comment.as_deref(), Some("shown on hover"));
+	}
+
+	/// A note can run to several lines; gettext writes one `#.` per line.
+	#[test]
+	fn a_note_over_several_lines_is_joined() {
+		let src = "#. TRANSLATORS: first half
+#. second half
+msgid \"Warning\"
+msgstr \"\"
+";
+		let doc = PoDocument::parse(src);
+		assert_eq!(doc.entries[0].comment.as_deref(), Some("first half second half"));
+	}
+
+	#[test]
+	fn an_entry_without_a_note_has_none() {
+		let doc = PoDocument::parse(
+			"msgid \"Warning\"
+msgstr \"\"
+",
+		);
+		assert_eq!(doc.entries[0].comment, None);
+	}
+
+	/// A blank line ends the entry a note belongs to, so it cannot drift onto the next one.
+	#[test]
+	fn a_note_does_not_reach_past_a_blank_line() {
+		let src = "#. TRANSLATORS: about the first
+msgid \"One\"
+msgstr \"\"
+
+msgid \"Two\"
+msgstr \"\"
+";
+		let doc = PoDocument::parse(src);
+		assert_eq!(doc.entries[0].comment.as_deref(), Some("about the first"));
+		assert_eq!(doc.entries[1].comment, None);
 	}
 
 	#[test]
