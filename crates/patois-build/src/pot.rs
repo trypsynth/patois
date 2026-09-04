@@ -135,6 +135,7 @@ fn write_pot(
 	let _ = fs::remove_dir_all(&scratch);
 	result?;
 	strip_format_flags(&temp_file)?;
+	fix_charset_header(&temp_file)?;
 	preserve_foreign_entries(&output_file, &temp_file)?;
 	if pot_changed(&output_file, &temp_file) {
 		fs::rename(&temp_file, &output_file)?;
@@ -233,6 +234,24 @@ fn strip_format_flags(path: &Path) -> Result<(), Box<dyn error::Error>> {
 	Ok(())
 }
 
+/// Declares the pot's own charset as UTF-8 in place of `xgettext`'s placeholder `CHARSET`.
+///
+/// `xgettext` always leaves this as a placeholder, on the assumption that a `.pot`'s real
+/// charset is only decided once a `.po` translation commits to one. That assumption holds only
+/// if the msgids and comments it scanned are themselves pure ASCII; this project's aren't (a
+/// few strings use symbols like `×`, and Kotlin/Swift's "many" plural marker embeds a literal
+/// U+2063 character), so the placeholder leaves the file declaring a charset that doesn't
+/// match its actual bytes. `msgmerge` enforces that mismatch strictly and refuses to read the
+/// file at all: "contains non-ASCII characters but the present charset ... is not UTF-8".
+fn fix_charset_header(path: &Path) -> Result<(), Box<dyn error::Error>> {
+	let content = fs::read_to_string(path)?;
+	let fixed = content.replacen("charset=CHARSET", "charset=UTF-8", 1);
+	if fixed != content {
+		fs::write(path, fixed)?;
+	}
+	Ok(())
+}
+
 /// Returns true if `.pot` content changed, ignoring the `POT-Creation-Date` header line.
 fn pot_changed(old: &Path, new: &Path) -> bool {
 	let strip_date = |s: &str| -> String {
@@ -315,6 +334,38 @@ msgstr \"\"
 		assert!(result.contains("#, fuzzy\nmsgid \"Old %s\""));
 		assert!(result.contains("#, fuzzy\nmsgid \"Cancel\""));
 		assert!(result.contains("msgid \"No flags here\""));
+	}
+
+	#[test]
+	fn fix_charset_header_replaces_the_placeholder() {
+		let content = "\
+msgid \"\"
+msgstr \"\"
+\"Content-Type: text/plain; charset=CHARSET\\n\"
+
+msgid \"Cancel\"
+msgstr \"\"
+";
+		let path = env::temp_dir().join(format!("patois-build-fix-charset-test-{}.pot", std::process::id()));
+		fs::write(&path, content).unwrap();
+		fix_charset_header(&path).unwrap();
+		let result = fs::read_to_string(&path).unwrap();
+		fs::remove_file(&path).unwrap();
+		assert!(result.contains("charset=UTF-8"));
+		assert!(!result.contains("charset=CHARSET"));
+	}
+
+	#[test]
+	fn fix_charset_header_is_a_no_op_once_already_utf8() {
+		let content = "\"Content-Type: text/plain; charset=UTF-8\\n\"\n";
+		let path = env::temp_dir().join(format!("patois-build-fix-charset-noop-test-{}.pot", std::process::id()));
+		fs::write(&path, content).unwrap();
+		let before = fs::metadata(&path).unwrap().modified().unwrap();
+		std::thread::sleep(std::time::Duration::from_millis(10));
+		fix_charset_header(&path).unwrap();
+		let after = fs::metadata(&path).unwrap().modified().unwrap();
+		fs::remove_file(&path).unwrap();
+		assert_eq!(before, after, "already-UTF-8 header should not be rewritten");
 	}
 
 	/// A pot with a header entry followed by `body`.
