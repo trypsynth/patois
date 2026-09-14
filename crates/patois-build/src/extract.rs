@@ -10,13 +10,16 @@ use std::{
 
 use crate::entries::{PotEntry, collect_pot_msgids, po_unescape, pot_entry_block};
 
-/// Collect source files with the given extension from a directory tree.
+/// Collect source files with the given extension from a directory tree in sorted order.
 fn collect_source_files(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn error::Error>> {
 	if !dir.is_dir() {
 		return Ok(());
 	}
-	for entry in fs::read_dir(dir)? {
-		let path = entry?.path();
+	let mut paths = fs::read_dir(dir)?.map(|entry| entry.map(|e| e.path())).collect::<Result<Vec<_>, _>>()?;
+	// `fs::read_dir` does not guarantee an order. Sort before visiting so POT entry order
+	// and the first occurrence chosen for each translator comment are reproducible.
+	paths.sort();
+	for path in paths {
 		if path.is_dir() {
 			collect_source_files(&path, extension, files)?;
 		} else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
@@ -30,8 +33,9 @@ fn collect_source_files(dir: &Path, extension: &str, files: &mut Vec<PathBuf>) -
 ///
 /// Scans files matching `extension` (e.g. `"swift"` or `"kt"`) for `t("...")` and
 /// `nt("...", "...", ...)` calls using a native Rust parser, no xgettext required. Handles
-/// standard C-style escape sequences in string literals and skips strings that are already
-/// present in the pot file.
+/// standard C-style escape sequences in string literals. Directories follow caller order;
+/// files within each directory are sorted by path. Repeated messages use the first
+/// occurrence and its translator comment.
 pub fn extend_pot_from_source_dirs(
 	dirs: &[impl AsRef<Path>],
 	extension: &str,
