@@ -50,8 +50,8 @@ impl WxTranslationManager {
 		let mgr = LanguageManager::new(&self.domain);
 		self.available_languages = mgr.available();
 		let raw_sys_lang = LanguageManager::system_language();
-		let sys_lang = raw_sys_lang.split('_').next().unwrap_or(&raw_sys_lang).to_string();
-		self.current_language = if self.is_language_available(&sys_lang) { sys_lang } else { "en".to_string() };
+		self.current_language =
+			best_available_language(&raw_sys_lang, &self.available_languages).unwrap_or_else(|| "en".to_string());
 		if self.current_language != "en" {
 			translations.set_language_str(&self.current_language);
 		}
@@ -98,6 +98,31 @@ impl WxTranslationManager {
 	pub fn is_language_available(&self, language_code: &str) -> bool {
 		self.available_languages.iter().any(|lang| lang.code == language_code)
 	}
+}
+
+/// The catalog that best fits `system_code`, or `None` when nothing does.
+///
+/// A system language carries a region the catalogs mostly do not (`de_DE` against `de`), and
+/// sometimes the catalog is the one carrying it (`zh_CN`, `pt_br`). Matching only on the part
+/// before the underscore therefore left a reader whose system says `zh_CN` with an English
+/// interface, in the language with one of the most complete translations, until they found the
+/// setting by hand. The order below is the same one Android's resource matching uses:
+///
+/// 1. the code exactly as the system gives it,
+/// 2. the same code ignoring case, since a catalog may be `pt_br` where the system says `pt_BR`,
+/// 3. the bare language, for `de_DE` against `de`,
+/// 4. any catalog for that language, so a reader in Taiwan gets the Simplified Chinese one
+///    rather than English.
+#[must_use]
+pub fn best_available_language(system_code: &str, available: &[LanguageInfo]) -> Option<String> {
+	let language_of = |code: &str| code.split(['_', '-']).next().unwrap_or(code).to_lowercase();
+	let wanted = system_code.to_lowercase();
+	let language = language_of(system_code);
+	let find = |matches: &dyn Fn(&str) -> bool| available.iter().find(|l| matches(&l.code)).map(|l| l.code.clone());
+	find(&|code| code == system_code)
+		.or_else(|| find(&|code| code.to_lowercase() == wanted))
+		.or_else(|| find(&|code| code.to_lowercase() == language))
+		.or_else(|| find(&|code| language_of(code) == language))
 }
 
 /// Populates `combo` with each language's display name and returns the parallel list of
@@ -163,5 +188,42 @@ mod tests {
 		let mut langs = manager.available_languages();
 		langs.push(LanguageInfo { code: "xx".to_string(), name: "Fake".to_string() });
 		assert!(!manager.is_language_available("xx"));
+	}
+
+	fn available(codes: &[&str]) -> Vec<LanguageInfo> {
+		codes.iter().map(|c| LanguageInfo { code: (*c).to_string(), name: (*c).to_string() }).collect()
+	}
+
+	#[test]
+	fn an_exact_code_wins() {
+		let langs = available(&["en", "de", "zh_CN"]);
+		assert_eq!(best_available_language("zh_CN", &langs).as_deref(), Some("zh_CN"));
+	}
+
+	/// The system says `pt_BR`, the catalog is named `pt_br`.
+	#[test]
+	fn the_same_code_in_another_case_still_matches() {
+		let langs = available(&["en", "pt_br"]);
+		assert_eq!(best_available_language("pt_BR", &langs).as_deref(), Some("pt_br"));
+	}
+
+	#[test]
+	fn a_region_the_catalogs_do_not_have_falls_back_to_the_language() {
+		let langs = available(&["en", "de"]);
+		assert_eq!(best_available_language("de_DE", &langs).as_deref(), Some("de"));
+	}
+
+	/// The reason this exists: the system carries the region and so does the catalog, but they
+	/// are not the same region.
+	#[test]
+	fn another_region_of_the_same_language_is_better_than_english() {
+		let langs = available(&["en", "zh_CN"]);
+		assert_eq!(best_available_language("zh_TW", &langs).as_deref(), Some("zh_CN"));
+	}
+
+	#[test]
+	fn a_language_with_no_catalog_matches_nothing() {
+		let langs = available(&["en", "de"]);
+		assert_eq!(best_available_language("ja_JP", &langs), None);
 	}
 }
