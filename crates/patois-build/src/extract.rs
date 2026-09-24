@@ -98,6 +98,12 @@ pub fn extend_pot_from_source_dirs(
 	let notes: HashMap<&str, Option<&str>> =
 		new_entries.iter().map(|e| (e.msgid.as_str(), e.comment.as_deref())).collect();
 	let refreshed = refresh_foreign_comments(&existing, &notes, extension);
+	// A string both front ends use is written by whichever scan ran first, and without this the
+	// second one leaves no mark on it at all. Pruning is per reference, so the entry then looks
+	// like it belongs to the other front end alone, and dropping the string there took it away
+	// from this one too.
+	let scanned: HashSet<&str> = new_entries.iter().map(|e| e.msgid.as_str()).collect();
+	let refreshed = add_reference_to_shared_entries(&refreshed, &scanned, extension);
 
 	// Append only truly new entries.
 	let mut additions = String::new();
@@ -162,27 +168,73 @@ pub fn prune_pot_from_source_dirs(
 	let existing = fs::read_to_string(pot_file)?;
 	let reference = format!("#: {extension}");
 	let mut removed: Vec<String> = Vec::new();
-	let kept: Vec<&str> = existing
+	let kept: Vec<String> = existing
 		.split("\n\n")
-		.filter(|block| {
+		.filter_map(|block| {
 			let lines: Vec<&str> = block.lines().collect();
 			if !lines.iter().any(|l| l.trim() == reference) {
-				return true;
+				return Some(block.to_string());
 			}
 			let Some(msgid) = block_msgid(&lines) else {
-				return true;
+				return Some(block.to_string());
 			};
 			if alive.contains(&msgid) {
-				return true;
+				return Some(block.to_string());
 			}
-			removed.push(msgid);
-			false
+			// Only this scan's claim on the string goes. Another front end may use the same
+			// string, and taking the whole entry would leave that one asking for a translation
+			// the pot no longer has.
+			let others: Vec<&str> =
+				lines.iter().copied().filter(|l| l.trim().starts_with("#: ") && l.trim() != reference).collect();
+			if others.is_empty() {
+				removed.push(msgid);
+				return None;
+			}
+			let trailing = if block.ends_with('\n') { "\n" } else { "" };
+			let rebuilt: Vec<&str> = lines.into_iter().filter(|l| l.trim() != reference).collect();
+			Some(format!("{}{trailing}", rebuilt.join("\n")))
 		})
 		.collect();
-	if !removed.is_empty() {
-		fs::write(pot_file, kept.join("\n\n"))?;
+	let rebuilt = kept.join("\n\n");
+	if rebuilt != existing {
+		fs::write(pot_file, rebuilt)?;
 	}
 	Ok(removed)
+}
+
+/// Adds this scan's `#:` reference to entries that are already in the pot under someone else's.
+///
+/// An entry only ever carries the reference of the scan that first wrote it, so a string used by
+/// both front ends looks like it belongs to one of them. Marking it as this scan's too is what
+/// lets [`prune_pot_from_source_dirs`] tell "nobody uses this any more" from "this front end
+/// stopped using it", and keep the entry in the second case.
+fn add_reference_to_shared_entries(content: &str, scanned: &HashSet<&str>, extension: &str) -> String {
+	let reference = format!("#: {extension}");
+	content
+		.split("\n\n")
+		.map(|block| {
+			let trailing = if block.ends_with('\n') { "\n" } else { "" };
+			let lines: Vec<&str> = block.lines().collect();
+			// An entry with no reference at all is xgettext's own, and the Rust scan rebuilds
+			// those from source every time, so a reference added here would not survive anyway.
+			if lines.iter().any(|l| l.trim() == reference) || !lines.iter().any(|l| l.trim().starts_with("#: ")) {
+				return block.to_string();
+			}
+			let Some(msgid) = block_msgid(&lines) else {
+				return block.to_string();
+			};
+			if !scanned.contains(msgid.as_str()) {
+				return block.to_string();
+			}
+			let Some(at) = lines.iter().position(|l| l.trim().starts_with("#: ")) else {
+				return block.to_string();
+			};
+			let mut rebuilt: Vec<&str> = lines;
+			rebuilt.insert(at, reference.as_str());
+			format!("{}{trailing}", rebuilt.join("\n"))
+		})
+		.collect::<Vec<String>>()
+		.join("\n\n")
 }
 
 /// Bring the `#.` notes on the entries this scan owns into line with what the sources now say.
@@ -555,6 +607,82 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir_all(&self.dir);
 		}
+	}
+
+	/// A string both front ends use is written once, by whichever scan ran first. The second
+	/// scan has to mark it as its own too, or dropping the string from the first front end takes
+	/// it away from the second as well.
+	#[test]
+	fn a_string_another_scan_already_wrote_gains_this_scan_s_reference() {
+		let src = SourceDir::with(
+			"shared-extend",
+			"Text(t(\"Settings exported\"))
+",
+		);
+		let pot = src.pot(
+			"msgid \"\"
+msgstr \"\"
+
+#: swift
+msgid \"Settings exported\"
+msgstr \"\"
+",
+		);
+		extend_pot_from_source_dirs(&[&src.dir], "kt", &pot).unwrap();
+		let after = fs::read_to_string(&pot).unwrap();
+		assert!(
+			after.contains(
+				"#: kt
+#: swift
+msgid \"Settings exported\""
+			),
+			"got:
+{after}"
+		);
+		assert_eq!(after.matches("msgid \"Settings exported\"").count(), 1, "and not a second copy of it");
+	}
+
+	/// The other half of the same story: with both references on the entry, the front end that
+	/// stopped using the string takes only its own reference away.
+	#[test]
+	fn a_shared_entry_keeps_the_other_scan_s_reference() {
+		let src = SourceDir::with(
+			"shared-prune",
+			"Text(t(\"Still called\"))
+",
+		);
+		let pot = src.pot(
+			"msgid \"\"
+msgstr \"\"
+
+#: kt
+msgid \"Still called\"
+msgstr \"\"
+
+#: kt
+#: swift
+msgid \"Shared\"
+msgstr \"\"
+",
+		);
+		let removed = prune_pot_from_source_dirs(&[&src.dir], "kt", &pot).unwrap();
+		assert!(removed.is_empty(), "the entry is still used elsewhere, so nothing was removed");
+		let after = fs::read_to_string(&pot).unwrap();
+		assert!(after.contains("msgid \"Shared\""), "the string itself stays");
+		assert!(
+			after.contains(
+				"#: swift
+msgid \"Shared\""
+			),
+			"under the other scan's reference: {after}"
+		);
+		assert!(
+			!after.contains(
+				"#: kt
+#: swift"
+			),
+			"and no longer under this one: {after}"
+		);
 	}
 
 	#[test]
