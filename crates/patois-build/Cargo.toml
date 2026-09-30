@@ -2,7 +2,7 @@
 name = "patois-build"
 version = "0.1.14"
 edition = "2024"
-description = "Build helper for patois: compiles .po translation files to .mo binaries and regenerates .pot templates."
+description = "Build helper for patois: compiles .po translation files to .mo binaries, regenerates .pot templates, and checks translations for common mistakes."
 license = "MIT"
 keywords = ["i18n", "l10n", "build", "gettext"]
 

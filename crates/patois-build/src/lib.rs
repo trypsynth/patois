@@ -1,9 +1,15 @@
 //! Build-script and `xtask` helpers for [patois](https://docs.rs/patois): compile `.po`
 //! catalogs into the `.mo` files an app loads at runtime, regenerate a `.pot` template from
 //! source, and generate the equivalent translation assets for iOS and Android.
+//!
+//! It also checks translations and source code for common mistakes ([`check`], [`lint`]), and
+//! reads the translator credits from the catalogs ([`credits`]).
 
+pub mod check;
+pub mod credits;
 mod entries;
 mod extract;
+pub mod lint;
 mod mo;
 mod mobile;
 pub mod po;
