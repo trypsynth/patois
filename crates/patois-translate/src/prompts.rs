@@ -78,6 +78,11 @@ pub fn markdown_system_prompt(app: &App, style: Option<&str>) -> String {
 	with_style(&fill(include_str!("../prompts/markdown.md"), app), style)
 }
 
+/// The system prompt for updating a readme section whose English changed; see [`phrase_system_prompt`] and [`crate::update`].
+pub fn update_system_prompt(app: &App, style: Option<&str>) -> String {
+	with_style(&fill(include_str!("../prompts/update.md"), app), style)
+}
+
 /// A prompt template with the app's name, description, and proper nouns filled in. The app's
 /// name always leads the proper nouns.
 #[allow(clippy::literal_string_with_formatting_args, reason = "the templates are Markdown files, not format strings")]

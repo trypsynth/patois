@@ -26,7 +26,11 @@ use serde_json::{Value, json};
 use crate::{
 	App,
 	markdown::{chunk_name, restore_code_spans, split_markdown, structure_mismatch},
-	prompts::{markdown_system_prompt, phrase_system_prompt, plural_schema, plural_system_prompt, translations_schema},
+	prompts::{
+		markdown_system_prompt, phrase_system_prompt, plural_schema, plural_system_prompt, translations_schema,
+		update_system_prompt,
+	},
+	update::{assemble, numbered},
 };
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -401,6 +405,69 @@ impl ClaudeClient {
 		Ok(unfenced(self.send(&request)?.trim()))
 	}
 
+	/// `english`, a readme section whose English changed, with each line of `existing` that still translates one of its lines kept exactly and only the rest translated. See [`crate::update`].
+	///
+	/// Falls back to [`Self::translate_markdown`] with the existing translation as guidance when no answer lines up after [`MARKDOWN_ATTEMPTS`], since a section reworded in places is better than a section not updated at all.
+	pub fn update_markdown(
+		&self,
+		english: &str,
+		existing: &str,
+		terms: &str,
+		target: &Target,
+	) -> Result<String, Box<dyn Error>> {
+		let mut previous: Option<String> = None;
+		for attempt in 1..=MARKDOWN_ATTEMPTS {
+			let request = self.update_request(english, existing, terms, target, previous.as_deref());
+			let answer = unfenced(self.send(&request)?.trim());
+			match assemble(english, existing, &answer) {
+				Ok(section) => return Ok(section),
+				Err(why) => {
+					eprintln!("{}: {why}; retrying the update ({attempt} of {MARKDOWN_ATTEMPTS})", chunk_name(english));
+					previous = Some(why);
+				}
+			}
+		}
+		eprintln!(
+			"{}: no update lined up, translating it with the existing translation as guidance",
+			chunk_name(english)
+		);
+		self.translate_markdown(english, &Guidance { existing: Some(existing), terms }, target)
+	}
+
+	fn update_request(
+		&self,
+		english: &str,
+		existing: &str,
+		terms: &str,
+		target: &Target,
+		previous_problem: Option<&str>,
+	) -> Value {
+		let correction = previous_problem.map_or_else(String::new, |why| {
+			format!(
+				"\n\nYour previous answer did not line up: {why}. Answer exactly one line per numbered English line."
+			)
+		});
+		let guidance = guidance_text(&Guidance { existing: None, terms });
+		json!({
+			"model": self.model,
+			"max_tokens": MAX_TOKENS,
+			"system": [{
+				"type": "text",
+				"text": update_system_prompt(&self.app, target.style),
+				"cache_control": { "type": "ephemeral" }
+			}],
+			"messages": [{
+				"role": "user",
+				"content": format!(
+					"Target language: {}{correction}{guidance}\n\n<english>\n{}\n</english>\n\n<existing_translation>\n{}\n</existing_translation>",
+					target.language,
+					numbered(english),
+					numbered(existing)
+				)
+			}]
+		})
+	}
+
 	/// Posts `request` and returns the first text block, retrying the statuses that deserve it.
 	fn send(&self, request: &Value) -> Result<String, Box<dyn Error>> {
 		let mut attempt = 0;
@@ -551,6 +618,30 @@ mod tests {
 		assert!(content.contains("&Settings"), "the source string must reach the request");
 		assert!(content.contains("Menu item"), "the translator note must reach the request");
 		assert!(content.contains("\"id\": 0") && content.contains("\"id\": 1"), "every entry needs its id");
+	}
+
+	#[test]
+	fn the_update_request_numbers_both_sides_and_carries_the_terms() {
+		let client = ClaudeClient { api_key: "test".to_string(), model: "test-model".to_string(), app: App::default() };
+		let target = Target { language: "Dutch", style: Some("Address the reader as \"je\".") };
+		let request = client.update_request(
+			"## Help\n\n* `F1`: View help.",
+			"## Hulp\n\n* `F1`: Help bekijken.",
+			"Help → Help",
+			&target,
+			Some("1 English lines were numbered and 2 answer lines came back"),
+		);
+		assert!(request.get("output_config").is_none(), "the answer is plain lines, not JSON");
+		let system = request["system"][0]["text"].as_str().unwrap();
+		assert!(system.contains("`=N`") && system.ends_with("Address the reader as \"je\"."), "got: {system}");
+		let content = request["messages"][0]["content"].as_str().unwrap();
+		assert!(content.contains("<english>\n1: ## Help\n2: * `F1`: View help.\n</english>"), "got: {content}");
+		assert!(
+			content.contains("<existing_translation>\n1: ## Hulp\n2: * `F1`: Help bekijken.\n</existing_translation>"),
+			"got: {content}"
+		);
+		assert!(content.contains("Help → Help"), "the interface terms reach the request");
+		assert!(content.contains("did not line up: 1 English lines"), "a retry is told what went wrong");
 	}
 
 	#[test]

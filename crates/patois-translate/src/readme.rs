@@ -120,11 +120,9 @@ fn translate_document(
 		let section_terms = terms.for_section(section);
 		match existing {
 			Some(Existing::Kept(text)) => out.push(text),
-			Some(Existing::Outdated(text)) => out.push(client.translate_markdown(
-				section,
-				&Guidance { existing: Some(&text), terms: &section_terms },
-				target,
-			)?),
+			Some(Existing::Outdated(text)) => {
+				out.push(client.update_markdown(section, &text, &section_terms, target)?)
+			}
 			None => out.push(client.translate_markdown(
 				section,
 				&Guidance { existing: None, terms: &section_terms },
