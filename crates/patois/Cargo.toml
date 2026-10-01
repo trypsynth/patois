@@ -1,6 +1,6 @@
 [package]
 name = "patois"
-version = "0.2.2"
+version = "0.2.3"
 description = "A lightweight, domain-aware i18n library for Rust desktop applications."
 edition = "2024"
 license = "MIT"
@@ -14,7 +14,9 @@ inventory = "0.3.24"
 # with no version requirement to stop cargo resolving it that way.
 patois-macros = { version = "=0.2.0", path = "../patois-macros" }
 sys-locale = "0.3.2"
-wxdragon = { version = "0.9.18", optional = true }
+# default-features = false so this does not decide for the application
+# which parts of wxWidgets get built; nothing here needs any of them.
+wxdragon = { version = "0.9.22", optional = true, default-features = false }
 
 [features]
 ui = ["dep:wxdragon"]
