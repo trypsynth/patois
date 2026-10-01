@@ -1,8 +1,10 @@
 use std::{
-	collections::hash_map::DefaultHasher,
+	collections::{HashMap, hash_map::DefaultHasher},
 	error::Error,
 	fs,
 	hash::{Hash, Hasher},
+	path::Path,
+	process::Command,
 };
 
 use patois::language_name;
@@ -11,9 +13,10 @@ use crate::{
 	Project,
 	claude::{ClaudeClient, Guidance, Target},
 	load_style_note,
-	markdown::split_sections,
+	markdown::{self, split_sections},
 	style_note_suffix,
 	terms::Terms,
+	update,
 };
 
 const MARKER_START: &str = "<!-- machine-translated from ";
@@ -21,6 +24,8 @@ const HASH_TAG: &str = " (source-hash: ";
 const MARKER_SUFFIX: &str = "); please review and edit as needed -->";
 /// Separates the whole-document hash from the per-section ones inside the marker.
 const SECTIONS_TAG: &str = "; sections: ";
+/// How far back through the readme's history [`previous_source`] looks for the English a translation was made from. A translation older than this is updated with the existing text as guidance instead.
+const HISTORY_LIMIT: usize = 200;
 
 /// Machine-translates the project's readme, such as `doc/readme.md`, into `doc/readme-<lang>.md`
 /// for every language in `langs`. Every language goes through the same pipeline, including ones that already have
@@ -54,6 +59,8 @@ pub fn sync_readmes(
 	let sections = split_sections(&source_md);
 	let hashes: Vec<String> = sections.iter().map(|section| section_hash(section)).collect();
 	let mut failed: Vec<String> = Vec::new();
+	// Most languages were last translated from the same English, so each version is looked up once.
+	let mut previous: HashMap<String, Option<Vec<String>>> = HashMap::new();
 	for lang in langs {
 		let target_path = doc_dir.join(format!("{stem}-{lang}.md"));
 		let existing = fs::read_to_string(&target_path).ok();
@@ -63,13 +70,20 @@ pub fn sync_readmes(
 		let reusable = existing.as_deref().and_then(|content| reusable_sections(content, &hashes));
 		let to_translate =
 			reusable.as_ref().map_or(sections.len(), |r| r.iter().filter(|s| s.kept().is_none()).count());
+		let was = existing.as_deref().and_then(existing_marker_hash).and_then(|was_hash| {
+			previous
+				.entry(was_hash.to_string())
+				.or_insert_with(|| previous_source(project.root, readme, was_hash).map(|md| split_sections(&md)))
+				.clone()
+		});
 		let style = load_style_note(project, lang);
 		if dry_run {
 			let style_note = style_note_suffix(project, lang, style.is_some());
 			match &reusable {
-				Some(_) => println!(
-					"{stem}-{lang}.md: would translate {to_translate} of {} sections{style_note}",
-					sections.len()
+				Some(reusable) => println!(
+					"{stem}-{lang}.md: would translate {to_translate} of {} sections{}{style_note}",
+					sections.len(),
+					update_summary(&sections, reusable, was.as_deref())
 				),
 				None => println!("{stem}-{lang}.md: would be translated in full{style_note}"),
 			}
@@ -84,7 +98,7 @@ pub fn sync_readmes(
 		// One language failing its checks does not stop the others: it is recorded and reported
 		// at the end. A nightly run that gives up on the first bad language would leave
 		// every language after it in the list stale for as long as that one kept failing.
-		match translate_document(client, &sections, reusable, &terms, &target) {
+		match translate_document(client, &sections, reusable, was.as_deref(), &terms, &target) {
 			Ok(translated_md) => {
 				fs::write(
 					&target_path,
@@ -104,11 +118,12 @@ pub fn sync_readmes(
 	Ok(())
 }
 
-/// The translated readme, section by section, carrying over the sections `reusable` already has and updating the ones whose English changed.
+/// The translated readme, section by section, carrying over the sections `reusable` already has and updating the ones whose English changed, line by line where `was`, the English the existing translation was made from, has the section's previous version.
 fn translate_document(
 	client: &ClaudeClient,
 	sections: &[String],
 	reusable: Option<Vec<Existing>>,
+	was: Option<&[String]>,
 	terms: &Terms,
 	target: &Target,
 ) -> Result<String, Box<dyn Error>> {
@@ -120,8 +135,17 @@ fn translate_document(
 		let section_terms = terms.for_section(section);
 		match existing {
 			Some(Existing::Kept(text)) => out.push(text),
-			Some(Existing::Outdated(text)) => {
-				out.push(client.update_markdown(section, &text, &section_terms, target)?)
+			Some(Existing::Outdated { translation, was_hash }) => {
+				match was.and_then(|was| was.iter().find(|old| section_hash(old) == was_hash)) {
+					Some(old) => {
+						out.push(client.update_markdown(old, section, &translation, &section_terms, target)?)
+					}
+					None => out.push(client.translate_markdown(
+						section,
+						&Guidance { existing: Some(&translation), terms: &section_terms },
+						target,
+					)?),
+				}
 			}
 			None => out.push(client.translate_markdown(
 				section,
@@ -131,6 +155,26 @@ fn translate_document(
 		}
 	}
 	Ok(out.join("\n\n"))
+}
+
+/// What a dry run says about how the changed sections would be updated: how many lines would be sent where the lines pair up, and which sections would be retranslated with the existing text as guidance instead.
+fn update_summary(sections: &[String], reusable: &[Existing], was: Option<&[String]>) -> String {
+	let mut lines = 0;
+	let mut whole: Vec<String> = Vec::new();
+	for (section, existing) in sections.iter().zip(reusable) {
+		let Existing::Outdated { translation, was_hash } = existing else { continue };
+		let old = was.and_then(|was| was.iter().find(|old| section_hash(old) == *was_hash));
+		match old.and_then(|old| update::plan(old, section, translation)) {
+			Some(plan) => lines += update::new_line_count(&plan),
+			None => whole.push(markdown::chunk_name(section)),
+		}
+	}
+	let mut summary = format!(" ({lines} changed {}", if lines == 1 { "line" } else { "lines" });
+	if !whole.is_empty() {
+		summary.push_str(&format!("; whole, with the existing text as guidance: {}", whole.join(", ")));
+	}
+	summary.push(')');
+	summary
 }
 
 /// Whether `doc/readme-<lang>.md` needs (re)translating: yes if it doesn't exist yet, or
@@ -157,15 +201,15 @@ fn needs_translation(existing_content: Option<&str>, current_source_hash: &str) 
 enum Existing {
 	/// Its English is unchanged, so it carries over as it is.
 	Kept(String),
-	/// Its English changed. It is what the model updates, so the lines that did not change keep their wording.
-	Outdated(String),
+	/// Its English changed, from the section whose hash is `was_hash`. It is what gets updated, so the lines that did not change keep their wording.
+	Outdated { translation: String, was_hash: String },
 }
 
 impl Existing {
 	fn kept(&self) -> Option<&str> {
 		match self {
 			Self::Kept(text) => Some(text),
-			Self::Outdated(_) => None,
+			Self::Outdated { .. } => None,
 		}
 	}
 }
@@ -185,9 +229,31 @@ fn reusable_sections(existing_content: &str, source_hashes: &[String]) -> Option
 			.iter()
 			.zip(source_hashes)
 			.zip(translated)
-			.map(|((was, now), text)| if was == now { Existing::Kept(text) } else { Existing::Outdated(text) })
+			.map(|((was, now), text)| {
+				if was == now {
+					Existing::Kept(text)
+				} else {
+					Existing::Outdated { translation: text, was_hash: (*was).to_string() }
+				}
+			})
 			.collect(),
 	)
+}
+
+/// The English `readme` was when its hash was `hash`, from the repository's history: what an existing translation was made from, so [`crate::update`] can tell which of its lines changed. `None` outside a git repository, in a shallow clone without that commit, or when no version within [`HISTORY_LIMIT`] matches.
+fn previous_source(root: &Path, readme: &Path, hash: &str) -> Option<String> {
+	let path = readme.to_string_lossy().replace('\\', "/");
+	let log = Command::new("git").current_dir(root).args(["log", "--format=%H", "--", &path]).output().ok()?;
+	if !log.status.success() {
+		return None;
+	}
+	String::from_utf8_lossy(&log.stdout).lines().take(HISTORY_LIMIT).find_map(|commit| {
+		let shown = Command::new("git").current_dir(root).args(["show", &format!("{commit}:{path}")]).output().ok()?;
+		let text = String::from_utf8(shown.stdout).ok().filter(|_| shown.status.success())?;
+		// The hash was taken from the file as checked out, which on Windows may have CRLF endings where the commit has LF.
+		let crlf = text.replace("\r\n", "\n").replace('\n', "\r\n");
+		[text.clone(), crlf].into_iter().find(|candidate| source_hash(candidate) == hash)
+	})
 }
 
 fn source_hash(source_md: &str) -> String {

@@ -30,7 +30,7 @@ use crate::{
 		markdown_system_prompt, phrase_system_prompt, plural_schema, plural_system_prompt, translations_schema,
 		update_system_prompt,
 	},
-	update::{assemble, numbered},
+	update::{Line, assemble, new_line_count, numbered_new_lines, plan},
 };
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -405,47 +405,58 @@ impl ClaudeClient {
 		Ok(unfenced(self.send(&request)?.trim()))
 	}
 
-	/// `english`, a readme section whose English changed, with each line of `existing` that still translates one of its lines kept exactly and only the rest translated. See [`crate::update`].
+	/// `now`, a readme section whose English changed from `was`, with the translation in `existing` kept for every line whose English did not change and only the rest translated. See [`crate::update`].
 	///
-	/// Falls back to [`Self::translate_markdown`] with the existing translation as guidance when no answer lines up after [`MARKDOWN_ATTEMPTS`], since a section reworded in places is better than a section not updated at all.
+	/// Falls back to [`Self::translate_markdown`] with the existing translation as guidance when the lines cannot be paired, or no answer fits after [`MARKDOWN_ATTEMPTS`], since a section reworded in places is better than one not updated at all.
 	pub fn update_markdown(
 		&self,
-		english: &str,
+		was: &str,
+		now: &str,
 		existing: &str,
 		terms: &str,
 		target: &Target,
 	) -> Result<String, Box<dyn Error>> {
+		let fallback = || self.translate_markdown(now, &Guidance { existing: Some(existing), terms }, target);
+		let Some(plan) = plan(was, now, existing) else {
+			eprintln!(
+				"{}: its translation does not line up with its English, translating it with the existing translation as guidance",
+				chunk_name(now)
+			);
+			return fallback();
+		};
+		if new_line_count(&plan) == 0 {
+			if let Ok(section) = assemble(now, &plan, "") {
+				return Ok(section);
+			}
+			return fallback();
+		}
 		let mut previous: Option<String> = None;
 		for attempt in 1..=MARKDOWN_ATTEMPTS {
-			let request = self.update_request(english, existing, terms, target, previous.as_deref());
+			let request = self.update_request(now, existing, &plan, terms, target, previous.as_deref());
 			let answer = unfenced(self.send(&request)?.trim());
-			match assemble(english, existing, &answer) {
+			match assemble(now, &plan, &answer) {
 				Ok(section) => return Ok(section),
 				Err(why) => {
-					eprintln!("{}: {why}; retrying the update ({attempt} of {MARKDOWN_ATTEMPTS})", chunk_name(english));
+					eprintln!("{}: {why}; retrying the update ({attempt} of {MARKDOWN_ATTEMPTS})", chunk_name(now));
 					previous = Some(why);
 				}
 			}
 		}
-		eprintln!(
-			"{}: no update lined up, translating it with the existing translation as guidance",
-			chunk_name(english)
-		);
-		self.translate_markdown(english, &Guidance { existing: Some(existing), terms }, target)
+		eprintln!("{}: no update fitted, translating it with the existing translation as guidance", chunk_name(now));
+		fallback()
 	}
 
 	fn update_request(
 		&self,
-		english: &str,
+		now: &str,
 		existing: &str,
+		plan: &[Line],
 		terms: &str,
 		target: &Target,
 		previous_problem: Option<&str>,
 	) -> Value {
 		let correction = previous_problem.map_or_else(String::new, |why| {
-			format!(
-				"\n\nYour previous answer did not line up: {why}. Answer exactly one line per numbered English line."
-			)
+			format!("\n\nYour previous answer did not fit: {why}. Answer exactly one line per numbered line, keeping each line's Markdown.")
 		});
 		let guidance = guidance_text(&Guidance { existing: None, terms });
 		json!({
@@ -459,10 +470,9 @@ impl ClaudeClient {
 			"messages": [{
 				"role": "user",
 				"content": format!(
-					"Target language: {}{correction}{guidance}\n\n<english>\n{}\n</english>\n\n<existing_translation>\n{}\n</existing_translation>",
+					"Target language: {}{correction}{guidance}\n\n<english_section>\n{now}\n</english_section>\n\n<existing_translation>\n{existing}\n</existing_translation>\n\n<lines_to_translate>\n{}\n</lines_to_translate>",
 					target.language,
-					numbered(english),
-					numbered(existing)
+					numbered_new_lines(plan)
 				)
 			}]
 		})
@@ -621,27 +631,35 @@ mod tests {
 	}
 
 	#[test]
-	fn the_update_request_numbers_both_sides_and_carries_the_terms() {
+	fn the_update_request_asks_only_for_the_new_lines() {
 		let client = ClaudeClient { api_key: "test".to_string(), model: "test-model".to_string(), app: App::default() };
 		let target = Target { language: "Dutch", style: Some("Address the reader as \"je\".") };
+		let was = "## Help\n\n* `F1`: View help.";
+		let now = "## Help\n\n* `F1`: View help.\n* `Ctrl+D`: Donate.";
+		let existing = "## Hulp\n\n* `F1`: Help bekijken.";
+		let plan = plan(was, now, existing).unwrap();
 		let request = client.update_request(
-			"## Help\n\n* `F1`: View help.",
-			"## Hulp\n\n* `F1`: Help bekijken.",
+			now,
+			existing,
+			&plan,
 			"Help → Help",
 			&target,
-			Some("1 English lines were numbered and 2 answer lines came back"),
+			Some("1 lines were asked for and 2 came back"),
 		);
 		assert!(request.get("output_config").is_none(), "the answer is plain lines, not JSON");
 		let system = request["system"][0]["text"].as_str().unwrap();
-		assert!(system.contains("`=N`") && system.ends_with("Address the reader as \"je\"."), "got: {system}");
+		assert!(system.ends_with("Address the reader as \"je\"."), "got: {system}");
 		let content = request["messages"][0]["content"].as_str().unwrap();
-		assert!(content.contains("<english>\n1: ## Help\n2: * `F1`: View help.\n</english>"), "got: {content}");
 		assert!(
-			content.contains("<existing_translation>\n1: ## Hulp\n2: * `F1`: Help bekijken.\n</existing_translation>"),
+			content.contains("<lines_to_translate>\n1: * `Ctrl+D`: Donate.\n</lines_to_translate>"),
 			"got: {content}"
 		);
+		assert!(
+			content.contains("<existing_translation>\n## Hulp"),
+			"the existing translation is there for its terms and tone"
+		);
 		assert!(content.contains("Help → Help"), "the interface terms reach the request");
-		assert!(content.contains("did not line up: 1 English lines"), "a retry is told what went wrong");
+		assert!(content.contains("did not fit: 1 lines"), "a retry is told what went wrong");
 	}
 
 	#[test]
