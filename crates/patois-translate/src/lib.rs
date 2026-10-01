@@ -35,6 +35,7 @@ mod claude;
 mod markdown;
 mod prompts;
 mod readme;
+mod terms;
 
 /// What the model is told about the app.
 #[derive(Debug, Clone, Default)]

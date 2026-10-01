@@ -9,10 +9,11 @@ use patois::language_name;
 
 use crate::{
 	Project,
-	claude::{ClaudeClient, Target},
+	claude::{ClaudeClient, Guidance, Target},
 	load_style_note,
 	markdown::split_sections,
 	style_note_suffix,
+	terms::Terms,
 };
 
 const MARKER_START: &str = "<!-- machine-translated from ";
@@ -60,7 +61,8 @@ pub fn sync_readmes(
 			continue;
 		}
 		let reusable = existing.as_deref().and_then(|content| reusable_sections(content, &hashes));
-		let to_translate = reusable.as_ref().map_or(sections.len(), |r| r.iter().filter(|s| s.is_none()).count());
+		let to_translate =
+			reusable.as_ref().map_or(sections.len(), |r| r.iter().filter(|s| s.kept().is_none()).count());
 		let style = load_style_note(project, lang);
 		if dry_run {
 			let style_note = style_note_suffix(project, lang, style.is_some());
@@ -76,10 +78,13 @@ pub fn sync_readmes(
 		let Some(client) = client else { unreachable!("client is always Some outside a dry run") };
 		let language = language_name(lang);
 		let target = Target { language, style: style.as_deref() };
+		let catalog =
+			fs::read_to_string(project.root.join(project.po_dir).join(format!("{lang}.po"))).unwrap_or_default();
+		let terms = Terms::from_catalog(&catalog);
 		// One language failing its checks does not stop the others: it is recorded and reported
 		// at the end. A nightly run that gives up on the first bad language would leave
 		// every language after it in the list stale for as long as that one kept failing.
-		match translate_document(client, &sections, reusable, &target) {
+		match translate_document(client, &sections, reusable, &terms, &target) {
 			Ok(translated_md) => {
 				fs::write(
 					&target_path,
@@ -99,31 +104,32 @@ pub fn sync_readmes(
 	Ok(())
 }
 
-/// The translated readme, section by section, carrying over the sections `reusable` already has.
+/// The translated readme, section by section, carrying over the sections `reusable` already has and updating the ones whose English changed.
 fn translate_document(
 	client: &ClaudeClient,
 	sections: &[String],
-	reusable: Option<Vec<Option<String>>>,
+	reusable: Option<Vec<Existing>>,
+	terms: &Terms,
 	target: &Target,
 ) -> Result<String, Box<dyn Error>> {
 	let mut out: Vec<String> = Vec::with_capacity(sections.len());
-	match reusable {
-		Some(reusable) => {
-			for (section, existing_section) in sections.iter().zip(reusable) {
-				match existing_section {
-					Some(kept) => out.push(kept),
-					None => out.push(client.translate_markdown(section, target)?),
-				}
-			}
-		}
-		// Still section by section with nothing to carry over, rather than the whole document in
-		// one request. The text comes out the same, but a section that comes back short is caught
-		// against the section it came from instead of disappearing into a response that covered
-		// half the readme.
-		None => {
-			for section in sections {
-				out.push(client.translate_markdown(section, target)?);
-			}
+	// Still section by section with nothing to carry over, rather than the whole document in one request. The text comes out the same, but a section that comes back short is caught against the section it came from instead of disappearing into a response that covered half the readme.
+	let reusable = reusable
+		.map_or_else(|| sections.iter().map(|_| None).collect(), |r| r.into_iter().map(Some).collect::<Vec<_>>());
+	for (section, existing) in sections.iter().zip(reusable) {
+		let section_terms = terms.for_section(section);
+		match existing {
+			Some(Existing::Kept(text)) => out.push(text),
+			Some(Existing::Outdated(text)) => out.push(client.translate_markdown(
+				section,
+				&Guidance { existing: Some(&text), terms: &section_terms },
+				target,
+			)?),
+			None => out.push(client.translate_markdown(
+				section,
+				&Guidance { existing: None, terms: &section_terms },
+				target,
+			)?),
 		}
 	}
 	Ok(out.join("\n\n"))
@@ -148,7 +154,25 @@ fn needs_translation(existing_content: Option<&str>, current_source_hash: &str) 
 /// removed shifts every section after it, and a hand-edited file may not be split the same way
 /// at all, so pairing by position would carry the wrong text across. Translating the whole
 /// document is slower but cannot silently reattach a heading to the wrong body.
-fn reusable_sections(existing_content: &str, source_hashes: &[String]) -> Option<Vec<Option<String>>> {
+/// A section of an existing translation, paired with the English section it translates.
+#[derive(Debug, PartialEq, Eq)]
+enum Existing {
+	/// Its English is unchanged, so it carries over as it is.
+	Kept(String),
+	/// Its English changed. It is what the model updates, so the lines that did not change keep their wording.
+	Outdated(String),
+}
+
+impl Existing {
+	fn kept(&self) -> Option<&str> {
+		match self {
+			Self::Kept(text) => Some(text),
+			Self::Outdated(_) => None,
+		}
+	}
+}
+
+fn reusable_sections(existing_content: &str, source_hashes: &[String]) -> Option<Vec<Existing>> {
 	let stored = existing_marker_section_hashes(existing_content)?;
 	if stored.len() != source_hashes.len() {
 		return None;
@@ -163,7 +187,7 @@ fn reusable_sections(existing_content: &str, source_hashes: &[String]) -> Option
 			.iter()
 			.zip(source_hashes)
 			.zip(translated)
-			.map(|((was, now), text)| (was == now).then_some(text))
+			.map(|((was, now), text)| if was == now { Existing::Kept(text) } else { Existing::Outdated(text) })
 			.collect(),
 	)
 }
@@ -260,9 +284,9 @@ mod tests {
 		);
 		let now = ["11111111".to_string(), "99999999".to_string(), "33333333".to_string()];
 		let reusable = reusable_sections(&content, &now).expect("sections line up");
-		assert!(reusable[0].is_some(), "unchanged first section should carry over");
-		assert!(reusable[1].is_none(), "changed section should be re-translated");
-		assert!(reusable[2].is_some(), "unchanged last section should carry over");
+		assert!(reusable[0].kept().is_some(), "unchanged first section should carry over");
+		assert!(reusable[1].kept().is_none(), "changed section should be re-translated");
+		assert!(reusable[2].kept().is_some(), "unchanged last section should carry over");
 	}
 
 	/// The same journey a real file makes: translated once, the English edited in one place,
@@ -316,10 +340,10 @@ New entry.
 Old entry.";
 		let now: Vec<String> = split_sections(after).iter().map(|s| section_hash(s)).collect();
 		let reusable = reusable_sections(&translated, &now).expect("same shape, so the sections pair up");
-		assert_eq!(reusable.iter().filter(|s| s.is_none()).count(), 1, "only the changelog changed");
-		assert!(reusable[2].is_none(), "the changelog is the section that changed");
-		assert!(reusable[0].as_deref().unwrap().contains("Titre"), "the title section carries over as translated");
-		assert!(reusable[1].as_deref().unwrap().contains("Fonctions"), "features carries over as translated");
+		assert_eq!(reusable.iter().filter(|s| s.kept().is_none()).count(), 1, "only the changelog changed");
+		assert!(reusable[2].kept().is_none(), "the changelog is the section that changed");
+		assert!(reusable[0].kept().unwrap().contains("Titre"), "the title section carries over as translated");
+		assert!(reusable[1].kept().unwrap().contains("Fonctions"), "features carries over as translated");
 	}
 
 	/// A file written before per-section hashes existed, or edited by hand into a different

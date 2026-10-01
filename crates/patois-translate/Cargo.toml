@@ -1,6 +1,6 @@
 [package]
 name = "patois-translate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Machine translation of gettext catalogs and Markdown readmes through the Claude API, for patois apps."
 license = "MIT"

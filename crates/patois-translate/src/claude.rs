@@ -86,10 +86,31 @@ pub struct Target<'a> {
 	pub style: Option<&'a str>,
 }
 
+/// What a readme section is translated with besides its English: the translation of its previous version, when there is one, and the interface's wording for the terms it names.
+#[derive(Default)]
+pub struct Guidance<'a> {
+	pub existing: Option<&'a str>,
+	pub terms: &'a str,
+}
+
 pub struct ClaudeClient {
 	api_key: String,
 	model: String,
 	app: App,
+}
+
+/// The request's extra instructions for `guidance`, or nothing when it has none.
+fn guidance_text(guidance: &Guidance) -> String {
+	let mut text = String::new();
+	if !guidance.terms.is_empty() {
+		// Without these a re-translated section renamed menus: the Russian Go menu became «Меню навигации», which is on no screen, instead of the interface's «Переход».
+		text.push_str(&format!("\n\nThe app's interface already words these terms as follows. Where the document names one of them, such as a menu, a dialog, a button or an option, use exactly this wording. Where a term lists more than one, separated by \" / \", the interface uses each for a different control; use the one that fits what the document is describing:\n<interface_terms>\n{}\n</interface_terms>", guidance.terms));
+	}
+	if let Some(existing) = guidance.existing {
+		// Without this, one new line re-translated its whole section in fresh wording, undoing whatever the translation's reviewers had settled on.
+		text.push_str(&format!("\n\nThis document is a newer version of text that is already translated, and this is the existing translation of the whole section it belongs to. Update that translation instead of translating afresh: keep every heading, sentence and list item whose English meaning did not change exactly as the existing translation words it, and translate only what is new or changed. Return the translation of the document alone, not of the rest of the section.\n<existing_translation>\n{existing}\n</existing_translation>"));
+	}
+	text
 }
 
 impl ClaudeClient {
@@ -283,10 +304,15 @@ impl ClaudeClient {
 	/// through `pandoc` into HTML, translate that, and convert it back, because its API had no
 	/// other way to protect code spans and fenced blocks from being translated; that round trip
 	/// is now just an instruction.
-	pub fn translate_markdown(&self, markdown: &str, target: &Target) -> Result<String, Box<dyn Error>> {
+	pub fn translate_markdown(
+		&self,
+		markdown: &str,
+		guidance: &Guidance,
+		target: &Target,
+	) -> Result<String, Box<dyn Error>> {
 		let mut translated: Vec<String> = Vec::new();
 		for chunk in split_markdown(markdown, README_CHUNK_CHARS) {
-			translated.push(self.translate_markdown_checked(&chunk, target)?);
+			translated.push(self.translate_markdown_checked(&chunk, guidance, target)?);
 		}
 		let joined = translated.join("\n\n");
 		Ok(restore_code_spans(markdown, &joined))
@@ -298,7 +324,12 @@ impl ClaudeClient {
 	/// usually gets it right. After [`MARKDOWN_ATTEMPTS`] tries this gives up loudly: half a
 	/// readme committed and opened as a pull request is worse than no readme, because nobody
 	/// reading the language it is in can tell which half is missing.
-	fn translate_markdown_checked(&self, markdown: &str, target: &Target) -> Result<String, Box<dyn Error>> {
+	fn translate_markdown_checked(
+		&self,
+		markdown: &str,
+		guidance: &Guidance,
+		target: &Target,
+	) -> Result<String, Box<dyn Error>> {
 		let mut last = String::new();
 		let mut last_text = String::new();
 		for attempt in 1..=MARKDOWN_ATTEMPTS {
@@ -306,7 +337,7 @@ impl ClaudeClient {
 			// same request mostly returns the same answer: German dropped one of the six list
 			// items under "File menu" on three identical tries.
 			let previous = (attempt > 1).then_some(last.as_str());
-			let translated = self.translate_markdown_chunk(markdown, target, previous)?;
+			let translated = self.translate_markdown_chunk(markdown, guidance, target, previous)?;
 			let Some(why) = structure_mismatch(markdown, &translated) else {
 				return Ok(translated);
 			};
@@ -330,6 +361,7 @@ impl ClaudeClient {
 	fn translate_markdown_chunk(
 		&self,
 		markdown: &str,
+		guidance: &Guidance,
 		target: &Target,
 		previous_problem: Option<&str>,
 	) -> Result<String, Box<dyn Error>> {
@@ -360,8 +392,9 @@ impl ClaudeClient {
 			"messages": [{
 				"role": "user",
 				"content": format!(
-					"Target language: {}{correction}\n\n<document>\n{markdown}\n</document>",
-					target.language
+					"Target language: {}{correction}{}\n\n<document>\n{markdown}\n</document>",
+					target.language,
+					guidance_text(guidance)
 				)
 			}]
 		});
