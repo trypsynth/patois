@@ -56,6 +56,17 @@ pub struct PoEntryLoc {
 	msgstr_range: Range<usize>,
 }
 
+/// An entry `msgmerge` retired as obsolete (`#~`) because its msgid left the template, which is
+/// still the best translation there is of a string that comes back with the same words.
+///
+/// Only ordinary entries are kept: a plural, or one with a `msgctxt`, is not the same string as an
+/// ordinary entry with its words.
+pub struct ObsoleteEntry {
+	pub msgid: String,
+	pub msgstr: String,
+	pub is_fuzzy: bool,
+}
+
 /// A parsed `.po` file, kept as its original lines so entries that aren't touched are
 /// re-rendered byte-for-byte identical to the source.
 ///
@@ -68,6 +79,9 @@ pub struct PoEntryLoc {
 pub struct PoDocument {
 	lines: Vec<String>,
 	pub entries: Vec<PoEntryLoc>,
+	/// The `#~` entries, which are never translation candidates and never patched. See
+	/// [`ObsoleteEntry`].
+	pub obsolete: Vec<ObsoleteEntry>,
 }
 
 impl PoDocument {
@@ -75,12 +89,26 @@ impl PoDocument {
 	pub fn parse(content: &str) -> Self {
 		let lines: Vec<String> = content.lines().map(str::to_string).collect();
 		let mut entries = Vec::new();
+		let mut obsolete = Vec::new();
 		let mut flag_line: Option<usize> = None;
 		let mut prev_msgid_range: Option<(usize, usize)> = None;
 		let mut pending_comment: Vec<String> = Vec::new();
 		let mut i = 0;
 		while i < lines.len() {
 			let trimmed = lines[i].trim_start();
+			if trimmed.starts_with("#~") {
+				let is_fuzzy = flag_line.is_some_and(|fl| lines[fl].contains("fuzzy"));
+				let mut block = Vec::new();
+				while let Some(rest) = lines.get(i).and_then(|line| line.trim_start().strip_prefix("#~")) {
+					block.push(rest.trim_start());
+					i += 1;
+				}
+				obsolete.extend(parse_obsolete(&block, is_fuzzy));
+				flag_line = None;
+				prev_msgid_range = None;
+				pending_comment.clear();
+				continue;
+			}
 			if trimmed.starts_with('#') {
 				if let Some(note) = trimmed.strip_prefix("#.") {
 					let note = note.trim();
@@ -156,7 +184,7 @@ impl PoDocument {
 			prev_msgid_range = None;
 			pending_comment.clear();
 		}
-		Self { lines, entries }
+		Self { lines, entries, obsolete }
 	}
 
 	/// Entries that still need a translation: blank `msgstr`, or fuzzy *because `msgmerge`
@@ -229,9 +257,19 @@ impl PoDocument {
 	/// lines that gettext would reject against that msgid. The reverse is skipped for the same
 	/// reason.
 	pub fn apply(&mut self, translations: &[(usize, Translation)]) {
+		let flagged: Vec<(usize, &Translation, bool)> = translations.iter().map(|(i, t)| (*i, t, true)).collect();
+		self.apply_flagged(&flagged);
+	}
+
+	/// Applies a batch of results like [`Self::apply`], each with whether to flag it fuzzy.
+	///
+	/// A result that is not flagged keeps the entry's other flags, such as `c-format`, and loses
+	/// any `#|` comment. That is for a translation a person already reviewed, such as one carried
+	/// over from an [`ObsoleteEntry`], which flagging fuzzy would wrongly mark as a guess.
+	pub fn apply_flagged(&mut self, translations: &[(usize, &Translation, bool)]) {
 		let mut ops: Vec<(Range<usize>, Vec<String>)> = Vec::new();
-		for (idx, translated) in translations {
-			let entry = &self.entries[*idx];
+		for &(idx, translated, fuzzy) in translations {
+			let entry = &self.entries[idx];
 			let replacement = match (translated, entry.msgid_plural.is_some()) {
 				(Translation::Singular(text), false) => vec![format!("msgstr \"{}\"", pot_escape(text))],
 				(Translation::Plural(forms), true) => {
@@ -239,13 +277,26 @@ impl PoDocument {
 				}
 				_ => continue,
 			};
+			let flags = if fuzzy { vec!["#, fuzzy".to_string()] } else { self.flags_without_fuzzy(entry) };
 			ops.push((entry.msgstr_range.clone(), replacement));
-			ops.push((entry.flag_block.clone(), vec!["#, fuzzy".to_string()]));
+			ops.push((entry.flag_block.clone(), flags));
 		}
 		ops.sort_by_key(|op| std::cmp::Reverse(op.0.start));
 		for (range, replacement) in ops {
 			self.lines.splice(range, replacement);
 		}
+	}
+
+	/// The entry's `#,` line with `fuzzy` taken out, or nothing when that leaves no flags.
+	fn flags_without_fuzzy(&self, entry: &PoEntryLoc) -> Vec<String> {
+		let kept: Vec<&str> = self.lines[entry.flag_block.clone()]
+			.iter()
+			.filter_map(|line| line.trim_start().strip_prefix("#,"))
+			.flat_map(|flags| flags.split(','))
+			.map(str::trim)
+			.filter(|flag| !flag.is_empty() && *flag != "fuzzy")
+			.collect();
+		if kept.is_empty() { Vec::new() } else { vec![format!("#, {}", kept.join(", "))] }
 	}
 
 	#[must_use]
@@ -254,6 +305,30 @@ impl PoDocument {
 		out.push('\n');
 		out
 	}
+}
+
+/// Reads one obsolete entry from its `#~` lines, with the marker taken off. `None` for a plural,
+/// one with a `msgctxt`, or anything without both a msgid and a msgstr. The `#~|` lines that hold
+/// a previous msgid start with `|`, so they are passed over.
+fn parse_obsolete(block: &[&str], is_fuzzy: bool) -> Option<ObsoleteEntry> {
+	let mut msgid: Option<String> = None;
+	let mut msgstr: Option<String> = None;
+	for line in block {
+		if line.starts_with("msgctxt") || line.starts_with("msgid_plural") || line.starts_with("msgstr[") {
+			return None;
+		}
+		if let Some(rest) = line.strip_prefix("msgid ") {
+			msgid = Some(po_unescape(rest));
+		} else if let Some(rest) = line.strip_prefix("msgstr ") {
+			msgstr = Some(po_unescape(rest));
+		} else if line.starts_with('"') {
+			let current = if msgstr.is_some() { msgstr.as_mut() } else { msgid.as_mut() };
+			if let Some(text) = current {
+				text.push_str(&po_unescape(line));
+			}
+		}
+	}
+	Some(ObsoleteEntry { msgid: msgid?, msgstr: msgstr?, is_fuzzy })
 }
 
 /// Reads a single `msgstr "..."` statement and its continuation lines, advancing `i` past it.
@@ -566,5 +641,50 @@ msgstr \"\"
 		let src = "msgid \"a\"\nmsgid_plural \"b\"\nmsgstr[0] \"\"\n\"joined\"\nmsgstr[1] \"x\"\n";
 		let doc = PoDocument::parse(src);
 		assert_eq!(doc.entries[0].msgstr_plural, vec!["joined".to_string(), "x".to_string()]);
+	}
+
+	#[test]
+	fn obsolete_entries_are_read_with_their_fuzzy_flag() {
+		let src = "msgid \"Open\"\nmsgstr \"Öffnen\"\n\n#~ msgid \"Toggle &Bookmark\"\n#~ msgstr \"&Lesezeichen umschalten\"\n\n#, fuzzy\n#~ msgid \"\"\n#~ \"Go to \"\n#~ \"&line...\"\n#~ msgstr \"Gehe zu &Zeile...\"\n";
+		let doc = PoDocument::parse(src);
+		assert_eq!(doc.entries.len(), 1);
+		let obsolete: Vec<_> = doc.obsolete.iter().map(|e| (e.msgid.as_str(), e.msgstr.as_str(), e.is_fuzzy)).collect();
+		assert_eq!(
+			obsolete,
+			vec![("Toggle &Bookmark", "&Lesezeichen umschalten", false), ("Go to &line...", "Gehe zu &Zeile...", true)]
+		);
+	}
+
+	#[test]
+	fn an_obsolete_plural_or_context_entry_is_not_kept() {
+		let src = "#~ msgid \"%d file\"\n#~ msgid_plural \"%d files\"\n#~ msgstr[0] \"%d Datei\"\n#~ msgstr[1] \"%d Dateien\"\n\n#~ msgctxt \"verb\"\n#~ msgid \"Open\"\n#~ msgstr \"Öffnen\"\n";
+		assert!(PoDocument::parse(src).obsolete.is_empty());
+	}
+
+	#[test]
+	fn a_previous_msgid_in_an_obsolete_entry_is_passed_over() {
+		let doc = PoDocument::parse("#~| msgid \"Old\"\n#~ msgid \"New\"\n#~ msgstr \"Neu\"\n");
+		assert_eq!(doc.obsolete[0].msgid, "New");
+	}
+
+	#[test]
+	fn an_unflagged_result_keeps_its_other_flags_and_loses_fuzzy() {
+		let src = "#, c-format\nmsgid \"%d left\"\nmsgstr \"\"\n\n#, fuzzy, c-format\n#| msgid \"%d remaining\"\nmsgid \"%d remain\"\nmsgstr \"%d übrig\"\n";
+		let mut doc = PoDocument::parse(src);
+		let first = Translation::Singular("noch %d".to_string());
+		let second = Translation::Singular("%d bleiben".to_string());
+		doc.apply_flagged(&[(0, &first, false), (1, &second, false)]);
+		assert_eq!(
+			doc.render(),
+			"#, c-format\nmsgid \"%d left\"\nmsgstr \"noch %d\"\n\n#, c-format\nmsgid \"%d remain\"\nmsgstr \"%d bleiben\"\n"
+		);
+	}
+
+	#[test]
+	fn an_unflagged_result_with_no_other_flags_has_no_flag_line() {
+		let mut doc = PoDocument::parse("msgid \"Open\"\nmsgstr \"\"\n");
+		let open = Translation::Singular("Öffnen".to_string());
+		doc.apply_flagged(&[(0, &open, false)]);
+		assert_eq!(doc.render(), "msgid \"Open\"\nmsgstr \"Öffnen\"\n");
 	}
 }

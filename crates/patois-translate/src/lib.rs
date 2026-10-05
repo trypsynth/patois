@@ -307,6 +307,41 @@ fn same_meaning_key(msgid: &str) -> String {
 		.collect()
 }
 
+/// Fills each blank entry from an obsolete one with the same words, returning the file with them
+/// filled and how many there were.
+///
+/// A string often changes only where its accelerator sits, as when a menu is rearranged so its
+/// items stop sharing a letter. `--no-fuzzy-matching` retires the old entry and leaves the new one
+/// blank, so without this the translation a person wrote is thrown away and the string translated
+/// afresh. It keeps its own accelerator, which its translator chose for that language, and stays
+/// fuzzy only if it already was. A person's translation wins over a machine's when both are there,
+/// and one that fails the placeholder or accelerator check is not used.
+fn restore_obsolete(content: String) -> (String, usize) {
+	let mut doc = PoDocument::parse(&content);
+	let mut found: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+	// People's translations first, so they are the ones found first.
+	let mut obsolete: Vec<_> = doc.obsolete.iter().filter(|entry| !entry.msgstr.is_empty()).collect();
+	obsolete.sort_by_key(|entry| entry.is_fuzzy);
+	for entry in obsolete {
+		found.entry(same_meaning_key(&entry.msgid)).or_default().push((entry.msgstr.clone(), entry.is_fuzzy));
+	}
+	let restored: Vec<(usize, Translation, bool)> = doc
+		.needs_translation()
+		.filter(|(i, _)| doc.entries[*i].msgstr.is_empty())
+		.filter_map(|(i, msgid)| {
+			let (text, fuzzy) =
+				found.get(&same_meaning_key(msgid))?.iter().find(|(text, _)| !is_damaged(msgid, text))?;
+			Some((i, Translation::Singular(text.clone()), *fuzzy))
+		})
+		.collect();
+	if restored.is_empty() {
+		return (content, 0);
+	}
+	let flagged: Vec<(usize, &Translation, bool)> = restored.iter().map(|(i, t, fuzzy)| (*i, t, *fuzzy)).collect();
+	doc.apply_flagged(&flagged);
+	(doc.render(), restored.len())
+}
+
 fn translate_one(
 	project: &Project,
 	po_path: &Path,
@@ -337,6 +372,11 @@ fn translate_one(
 	}
 	let merged = fs::read_to_string(&tmp)?;
 	let _ = fs::remove_file(&tmp);
+	let (merged, restored) = restore_obsolete(merged);
+	if restored > 0 {
+		let verb = if client.is_some() { "restored" } else { "would restore" };
+		println!("{lang}: {verb} {restored} entries from obsolete ones with the same words");
+	}
 	let mut doc = PoDocument::parse(&merged);
 	let mut candidates: Vec<(usize, String)> = doc.needs_translation().map(|(i, m)| (i, m.to_string())).collect();
 	let mut plurals: Vec<(usize, String, String)> =
@@ -528,6 +568,43 @@ mod tests {
 			("Open", "Abrir", true),
 		]);
 		assert!(copied(&doc).is_empty());
+	}
+
+	/// Paperback's menus were rearranged so no two items share an accelerator, which moved the
+	/// `&` in seventeen strings and nothing else. Every language lost its translation of all of
+	/// them, and the ones a person wrote were replaced with worse machine translations.
+	#[test]
+	fn a_string_whose_accelerator_moved_keeps_its_translation() {
+		let po = "msgid \"\"\nmsgstr \"Content-Type: text/plain; charset=UTF-8\\n\"\n\n#. TRANSLATORS: menu item\nmsgid \"&Toggle Bookmark\"\nmsgstr \"\"\n\nmsgid \"Go to li&ne...\"\nmsgstr \"\"\n\nmsgid \"&View\"\nmsgstr \"\"\n\n#~ msgid \"Toggle &Bookmark\"\n#~ msgstr \"&Lesezeichen umschalten\"\n\n#, fuzzy\n#~ msgid \"Go to &line...\"\n#~ msgstr \"Gehe zu &Zeile...\"\n";
+		let (restored, count) = restore_obsolete(po.to_string());
+		assert_eq!(count, 2);
+		assert!(
+			restored.contains(
+				"#. TRANSLATORS: menu item\nmsgid \"&Toggle Bookmark\"\nmsgstr \"&Lesezeichen umschalten\"\n"
+			),
+			"{restored}"
+		);
+		assert!(restored.contains("#, fuzzy\nmsgid \"Go to li&ne...\"\nmsgstr \"Gehe zu &Zeile...\"\n"), "{restored}");
+		assert!(restored.contains("msgid \"&View\"\nmsgstr \"\"\n"), "{restored}");
+	}
+
+	#[test]
+	fn a_person_s_obsolete_translation_wins_over_a_machine_s() {
+		let po = "msgid \"&Links\"\nmsgstr \"\"\n\n#, fuzzy\n#~ msgid \"Lin&ks\"\n#~ msgstr \"&Verknüpfungen\"\n\n#~ msgid \"Links\"\n#~ msgstr \"Links\"\n\n#~ msgid \"L&inks\"\n#~ msgstr \"&Links\"\n";
+		let (restored, _) = restore_obsolete(po.to_string());
+		assert!(restored.starts_with("msgid \"&Links\"\nmsgstr \"&Links\"\n"), "{restored}");
+	}
+
+	#[test]
+	fn an_obsolete_translation_that_fails_the_check_is_not_restored() {
+		let po = "msgid \"&Open %s\"\nmsgstr \"\"\n\n#~ msgid \"Open %s\"\n#~ msgstr \"%s öffnen\"\n";
+		assert_eq!(restore_obsolete(po.to_string()).1, 0);
+	}
+
+	#[test]
+	fn a_string_with_different_words_is_not_restored() {
+		let po = "msgid \"Export\"\nmsgstr \"\"\n\n#~ msgid \"I&mport/Export\"\n#~ msgstr \"I&mport/Export\"\n";
+		assert_eq!(restore_obsolete(po.to_string()).1, 0);
 	}
 
 	#[test]
