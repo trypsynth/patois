@@ -1,6 +1,6 @@
 [package]
 name = "patois-macros"
-version = "0.2.0"
+version = "0.2.1"
 description = "Proc macros for patois."
 edition = "2024"
 license = "MIT"
@@ -9,6 +9,7 @@ license = "MIT"
 proc-macro = true
 
 [dependencies]
+miniz_oxide = "0.9.1"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
 syn = { version = "3.0.3", features = ["full"] }

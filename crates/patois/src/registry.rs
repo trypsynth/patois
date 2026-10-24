@@ -1,7 +1,6 @@
 use std::{
 	collections::HashMap,
 	fs::File,
-	io::Cursor,
 	path::PathBuf,
 	sync::{Mutex, OnceLock},
 };
@@ -105,7 +104,8 @@ impl Registry {
 				if ed.name == domain {
 					for (file_locale, bytes) in ed.files {
 						if *file_locale == loc
-							&& let Ok(catalog) = Catalog::parse(Cursor::new(*bytes))
+							&& let Some(mo) = crate::__inflate(bytes)
+							&& let Ok(catalog) = Catalog::parse(mo.as_slice())
 						{
 							return Some(catalog);
 						}
@@ -152,6 +152,18 @@ mod tests {
 		assert_eq!(normalize_locale("en-US"), "en_US");
 		assert_eq!(normalize_locale("DE_de"), "de_DE");
 		assert_eq!(normalize_locale("fr"), "fr");
+	}
+
+	#[test]
+	fn inflate_undoes_the_macros_deflate() {
+		let catalog = b"msgid and msgstr bytes ".repeat(20);
+		assert_eq!(crate::__inflate(&miniz_oxide::deflate::compress_to_vec(&catalog, 10)), Some(catalog));
+	}
+
+	// A .mo file that was never deflated opens with its magic number, which is not a valid deflate stream, so it is skipped rather than misread.
+	#[test]
+	fn inflate_rejects_a_catalog_that_was_never_deflated() {
+		assert_eq!(crate::__inflate(b"\xDE\x12\x04\x95"), None);
 	}
 
 	#[test]

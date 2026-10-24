@@ -5,11 +5,14 @@ use std::{
 };
 
 use proc_macro::TokenStream;
+use proc_macro2::{Literal, TokenStream as TokenStream2};
 use quote::quote;
 
 /// Embed the calling crate's locale files into the binary at compile time.
 ///
 /// Scans `<crate_root>/locale/<lang>/LC_MESSAGES/<crate_name>.mo` for every compiled `.mo` file and registers them with the patois global registry via the `inventory` crate. Call once at module level in a library crate.
+///
+/// Each catalog is stored deflated and inflated only when its locale is first asked for, so a binary carrying a dozen languages pays for one at a time in memory and about a third of their size on disk.
 ///
 /// The locale directory and `.mo` files must exist at compile time. Typically
 /// this means generating them in a `build.rs` that emits `cargo:rerun-if-changed=locale`.
@@ -28,10 +31,8 @@ pub fn embed_domain(_input: TokenStream) -> TokenStream {
 			let locale_name = entry.file_name().to_string_lossy().to_string();
 			let mo_path = entry.path().join("LC_MESSAGES").join(format!("{pkg_name}.mo"));
 			if mo_path.exists() {
-				let mo_path_str = mo_path.to_string_lossy().to_string();
-				file_entries.push(quote! {
-					(#locale_name, { const B: &[u8] = include_bytes!(#mo_path_str); B })
-				});
+				let catalog = embedded_catalog(&mo_path);
+				file_entries.push(quote! { (#locale_name, #catalog) });
 			}
 		}
 	}
@@ -73,8 +74,8 @@ pub fn embed_wx_translations(_input: TokenStream) -> TokenStream {
 		catalogs = matching_wx_catalogs(&locale_dir, &app_langs);
 	}
 	let file_entries = catalogs.iter().map(|(lang, mo_path)| {
-		let mo_path_str = mo_path.to_string_lossy().to_string();
-		quote! { (#lang, { const B: &[u8] = include_bytes!(#mo_path_str); B }) }
+		let catalog = embedded_catalog(mo_path);
+		quote! { (#lang, #catalog) }
 	});
 	quote! {
 		/// A `TranslationsLoader` that serves wxWidgets' own embedded `wxstd` catalogs.
@@ -98,7 +99,11 @@ pub fn embed_wx_translations(_input: TokenStream) -> TokenStream {
 				if !Self::is_wxstd_domain(domain) {
 					return None;
 				}
-				Self::CATALOGS.iter().find(|(l, _)| *l == lang).map(|(_, bytes)| ::std::borrow::Cow::Borrowed(*bytes))
+				Self::CATALOGS
+					.iter()
+					.find(|(l, _)| *l == lang)
+					.and_then(|(_, bytes)| ::patois::__inflate(bytes))
+					.map(::std::borrow::Cow::Owned)
 			}
 
 			fn available_translations(&self, domain: &str) -> ::std::vec::Vec<::std::string::String> {
@@ -110,6 +115,20 @@ pub fn embed_wx_translations(_input: TokenStream) -> TokenStream {
 		}
 	}
 	.into()
+}
+
+/// The catalog at `path` as a block expression yielding its deflated bytes.
+///
+/// The `include_bytes!` is never read, so it adds nothing to the binary. It is there because cargo rebuilds a crate when a file it includes changes, and reading the catalog here in the macro is invisible to cargo.
+fn embedded_catalog(path: &Path) -> TokenStream2 {
+	let path_str = path.to_string_lossy().to_string();
+	let bytes = fs::read(path).unwrap_or_else(|e| panic!("couldn't read {}: {e}", path.display()));
+	let deflated = Literal::byte_string(&miniz_oxide::deflate::compress_to_vec(&bytes, 10));
+	quote! {{
+		const _: &[u8] = include_bytes!(#path_str);
+		const B: &[u8] = #deflated;
+		B
+	}}
 }
 
 /// Languages the calling crate ships, as lowercased directory names from `<manifest_dir>/locale/`.

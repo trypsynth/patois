@@ -39,6 +39,7 @@ pub use patois_macros::embed_wx_translations;
 /// This type is public so the macro output can name it, but you should never construct it manually. Use `embed_domain!()` instead.
 pub struct EmbeddedDomain {
 	pub name: &'static str,
+	/// Each locale's `.mo` catalog, deflated.
 	pub files: &'static [(&'static str, &'static [u8])],
 }
 
@@ -157,6 +158,13 @@ pub fn init_auto(domain: &str) {
 	let mut reg = registry::global().lock().unwrap();
 	reg.set_default_domain(domain);
 	reg.set_locale(&locale);
+}
+
+/// Inflates a catalog the embedding macros deflated. Public so `embed_wx_translations!` output can call it.
+#[doc(hidden)]
+#[must_use]
+pub fn __inflate(deflated: &[u8]) -> Option<Vec<u8>> {
+	miniz_oxide::inflate::decompress_to_vec(deflated).ok()
 }
 
 #[doc(hidden)]

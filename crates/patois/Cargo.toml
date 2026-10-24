@@ -1,6 +1,6 @@
 [package]
 name = "patois"
-version = "0.2.3"
+version = "0.2.4"
 description = "A lightweight, domain-aware i18n library for Rust desktop applications."
 edition = "2024"
 license = "MIT"
@@ -9,10 +9,11 @@ categories = ["localization", "internationalization"]
 
 [dependencies]
 inventory = "0.3.24"
+miniz_oxide = "0.9.1"
 # Pinned exactly, not `^`: `embed_domain!` expands to code naming this crate's own
 # `EmbeddedDomain` type, so a mismatched pair would fail to compile for a downstream user
 # with no version requirement to stop cargo resolving it that way.
-patois-macros = { version = "=0.2.0", path = "../patois-macros" }
+patois-macros = { version = "=0.2.1", path = "../patois-macros" }
 sys-locale = "0.3.2"
 # default-features = false so this does not decide for the application
 # which parts of wxWidgets get built; nothing here needs any of them.
