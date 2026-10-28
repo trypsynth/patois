@@ -326,6 +326,10 @@ fn read_string_literal(chars: &[char], mut pos: usize) -> Option<(String, usize)
 					't' => s.push('\t'),
 					'"' => s.push('"'),
 					'\\' => s.push('\\'),
+					'u' if let Some((c, next)) = read_unicode_escape(chars, pos) => {
+						s.push(c);
+						pos = next - 1;
+					}
 					c => {
 						s.push('\\');
 						s.push(c);
@@ -340,6 +344,21 @@ fn read_string_literal(chars: &[char], mut pos: usize) -> Option<(String, usize)
 			}
 		}
 	}
+}
+
+/// Decode the `\u{…}` (Rust, Swift) or `\uXXXX` (Kotlin) escape whose `u` is at `pos`, returning the character and the index just past the escape.
+pub(crate) fn read_unicode_escape(chars: &[char], pos: usize) -> Option<(char, usize)> {
+	let (start, end, next) = if chars.get(pos + 1) == Some(&'{') {
+		let close = pos + 2 + chars.get(pos + 2..)?.iter().position(|&c| c == '}')?;
+		(pos + 2, close, close + 1)
+	} else {
+		(pos + 1, pos + 5, pos + 5)
+	};
+	let hex: String = chars.get(start..end)?.iter().collect();
+	if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+		return None;
+	}
+	Some((char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?, next))
 }
 
 /// The tag a note must open with to be picked up, matching the `--add-comments=TRANSLATORS`
@@ -519,6 +538,11 @@ mod tests {
 	fn unicode_passthrough() {
 		let src = "t(\"Search\u{2026}\")";
 		assert_eq!(t_texts(src), vec!["Search\u{2026}"]);
+	}
+
+	#[test]
+	fn unicode_escapes_are_decoded() {
+		assert_eq!(t_texts(r#"t("1.5\u{00d7}") t("“quoted”")"#), vec!["1.5\u{d7}", "\u{201c}quoted\u{201d}"]);
 	}
 
 	#[test]

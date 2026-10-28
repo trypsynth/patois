@@ -8,10 +8,12 @@
 //! fed to one `xgettext` invocation).
 //!
 //! This neutralizes both constructs before the source ever reaches `xgettext`, while leaving
-//! actual double-quoted string literals and `//`/`/* */` comments byte-for-byte untouched
+//! actual double-quoted string literals (bar their `\u{…}` escapes) and `//`/`/* */` comments untouched
 //! (comments matter here since `// TRANSLATORS:` lines must survive verbatim). Replacements are
 //! always same-length-per-line (characters become spaces, newlines stay newlines), so line
 //! numbers — and therefore comment-to-string adjacency — never shift.
+
+use crate::extract::read_unicode_escape;
 
 pub fn sanitize_for_xgettext(src: &str) -> String {
 	let chars: Vec<char> = src.chars().collect();
@@ -51,6 +53,20 @@ pub fn sanitize_for_xgettext(src: &str) -> String {
 			i += 1;
 			while i < n {
 				let ch = chars[i];
+				// C has no `\u{…}`, so xgettext would copy it into the msgid verbatim.
+				if ch == '\\'
+					&& chars.get(i + 1) == Some(&'u')
+					&& let Some((decoded, next)) = read_unicode_escape(&chars, i + 1)
+				{
+					match decoded {
+						'"' | '\\' => out.extend(['\\', decoded]),
+						'\n' => out.push_str("\\n"),
+						'\t' => out.push_str("\\t"),
+						_ => out.push(decoded),
+					}
+					i = next;
+					continue;
+				}
 				out.push(ch);
 				if ch == '\\' && i + 1 < n {
 					out.push(chars[i + 1]);
@@ -187,6 +203,12 @@ mod tests {
 		assert!(out.contains("'{'"));
 		assert!(out.contains("'\\n'"));
 		assert!(out.contains("'\\''"));
+	}
+
+	#[test]
+	fn decodes_unicode_escapes_in_strings() {
+		let src = "t(\"{} on \\u{201c}{}\\u{201d}: \\u{22}\\u{5c}\");\nlet c = '\\u{2603}';\n";
+		assert_eq!(sanitize_for_xgettext(src), "t(\"{} on \u{201c}{}\u{201d}: \\\"\\\\\");\nlet c = '\\u{2603}';\n");
 	}
 
 	#[test]
